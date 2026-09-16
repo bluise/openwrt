@@ -50,12 +50,81 @@ GitHub Actions 在线自动构建 OpenWrt 25.12 x86_64 固件（基于官方 Ima
 
 两者都能启动，按需求选一个刷。
 
-## 刷机
+## 安装步骤
 
-1. 下载 `*combined-efi.img.gz`
-2. 用 Rufus（DD 模式）/ Etcher / dd 写入 U 盘
-3. U 盘启动，系统起来后执行 `openwrt-install` 安装到内置硬盘
-4. 默认登录：`http://10.0.0.1`，首次需 `passwd` 设置密码
+### 一、准备固件
+
+从 **Release（`firmware` tag）** 或某次 Run 的 **Artifacts** 下载，二选一：
+
+| 文件 | 根文件系统 | 适合 |
+|------|-----------|------|
+| `*ext4-combined-efi.img.gz` | ext4（可写） | 内置盘长期使用（推荐） |
+| `*squashfs-combined-efi.img.gz` | squashfs（只读） | 抗写坏、可一键恢复出厂 |
+
+两者均支持 **UEFI 与传统 BIOS** 双启动。
+
+### 二、写入 U 盘（≥ 512 MB 即可）
+
+Linux / macOS：
+
+```sh
+gunzip -c openwrt-*-combined-efi.img.gz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
+```
+
+⚠️ `/dev/sdX` 是**整个 U 盘设备**（如 `/dev/sdb`），**不要**写成分区（`/dev/sdb1`）。
+
+Windows：用 **Rufus** 选 **DD 模式**（不要用 ISO 模式，会破坏分区表），或 Etcher。
+
+### 三、U 盘启动
+
+开机按 F2 / F11 / Del 进启动菜单，选择 U 盘。UEFI 机器选带 `UEFI:` 前缀的那一项。
+
+### 四、安装到内置硬盘
+
+系统起来后（默认地址 `http://10.0.0.1`），SSH 或接显示器登录，执行：
+
+```sh
+openwrt-install
+```
+
+脚本会：
+1. 自动识别内置 SATA/NVMe 硬盘（排除启动 U 盘）
+2. 自动查找 U 盘上的固件镜像
+3. 显示目标盘并**倒计时 5 秒**（此时 Ctrl+C 可取消）—— **会清空目标盘所有数据**
+4. 写入镜像
+5. 只读检测空间并说明结果
+
+指定固件路径或确认盘位：
+
+```sh
+openwrt-install /path/to/openwrt-*-combined-efi.img.gz
+```
+
+### 五、重启与首次登录
+
+```sh
+# 拔掉 U 盘后重启
+reboot
+```
+
+重启后访问 **http://10.0.0.1**（LAN 口 **eth1**），**首次必须设置密码**：
+
+```sh
+passwd
+```
+
+然后即可用 `root` + 新密码登录 LuCI（`https://10.0.0.1`）。
+
+### 六、确认空间
+
+本固件 rootfs 已固定 **2048 MiB**，正常情况下**装完无需任何操作**，脚本会显示：
+
+```
+[INFO] rootfs 分区 2048 MiB (已达目标 2048 MiB) ✅
+[INFO] 剩余空间保持未分配, 未创建数据分区(本固件的约定)
+```
+
+若显示的是扩容提示，见下一节。
 
 ## 空间与扩容
 
