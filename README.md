@@ -1,4 +1,4 @@
-# OpenWrt 25.12 定制固件 (Lenovo U35)
+# OpenWrt 25.12 定制固件
 
 GitHub Actions 在线自动编译 OpenWrt 25.12 x86_64 固件。
 
