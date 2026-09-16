@@ -171,11 +171,41 @@ jobs:
         if: steps.release.outputs.build == 'true'
         run: |
           set -euo pipefail
+          # 来源1: scripts/packages.list (官方源里的包)
           mapfile -t PKGS < <(grep -vE '^[[:space:]]*(#|$)' scripts/packages.list)
-          PKGS+=(kmod-oaf appfilter)
+          # 来源2: 从第三方 release 拉取的预编译包(它们不在 packages.list 里!)
+          #   kmod-oaf / appfilter 来自 OAF 的 per-target tar.gz
+          #   luci-app-oaf / luci-app-openclash 来自各自 release 的 .apk
+          # 注意: 这几行曾遗漏, 导致插件被静默丢弃(固件 255 个包而非 285 个),
+          # 下面的自检就是为了防止再次遗漏。
+          PKGS+=(kmod-oaf appfilter luci-app-oaf luci-app-openclash)
           printf '%s\n' "${PKGS[@]}" > /tmp/pkgs.txt
           echo "==> 共 ${#PKGS[@]} 个包:"
           printf '  %s\n' "${PKGS[@]}"
+
+      - name: Self-check package list covers staged local packages
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # 自检: packages/ 目录里每个本地 apk 的包名都必须出现在待装清单中,
+          # 否则说明上面 PKGS+= 漏了东西 —— 直接失败, 不产出缺插件的固件。
+          IB_DIR_PKGS="${IB_DIR}/packages"
+          fail=0
+          for f in "${IB_DIR_PKGS}"/*.apk; do
+            base=$(basename "$f" .apk)
+            # 文件名形如 <name>-<version>, 去掉版本号得到包名
+            name=$(echo "$base" | sed -E 's/-[0-9][^-]*(~[^-]*)?(-r[0-9]+)?$//; s/-[0-9][^-]*-r[0-9]+$//')
+            # base-files/libc/kernel 由 ImageBuilder 自行处理, 无需显式列出
+            case "$name" in base-files|libc|kernel) continue ;; esac
+            if grep -qx -- "$name" /tmp/pkgs.txt; then
+              echo "  [自检 OK] $name"
+            else
+              echo "::error::本地包 '$name'($(basename "$f"))不在待安装清单中, 会被丢弃!"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "==> 自检通过: 所有本地包都在清单中"
 
       - name: Rebuild local package index
         if: steps.release.outputs.build == 'true'
