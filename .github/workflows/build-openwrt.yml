@@ -72,9 +72,6 @@ jobs:
     if: github.event_name == 'push' || needs.check-upstream.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
@@ -85,6 +82,9 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
           remove-docker-images: 'true'
+
+      - name: Checkout
+        uses: actions/checkout@v5
 
       - name: Prepare build env & clean temp files
         run: |
