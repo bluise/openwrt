@@ -12,7 +12,7 @@ GitHub Actions 在线自动构建 OpenWrt 25.12 x86_64 固件（基于官方 Ima
 - **MT7922** 无线网卡驱动 (mt7921e + 固件)
 - **USB / SATA / NVMe** 存储与内置盘支持
 - **LuCI 中文界面 + HTTPS**
-- **rootfs 分区 1024 MiB**（官方默认仅约 104 MiB，见下文「空间与扩容」）
+- **rootfs 分区 2048 MiB**（官方默认仅约 104 MiB，见下文「空间与扩容」）
 - **内置 `resize2fs` + `sfdisk`**，装到内置盘后可直接扩容
 - **内置 `openwrt-install`** 一键安装到内置硬盘命令
 
@@ -62,16 +62,16 @@ GitHub Actions 在线自动构建 OpenWrt 25.12 x86_64 固件（基于官方 Ima
 固件内嵌的 GPT 只描述镜像自身大小，**写入大容量硬盘后分区不会自动占满整盘** ——
 必须重写 GPT + 扩分区 + 扩文件系统三步。
 
-本固件已把 rootfs 分区做到 **1024 MiB**（官方默认仅约 104 MiB），并且内置了
+本固件已把 rootfs 分区做到 **2048 MiB**（官方默认仅约 104 MiB），并且内置了
 `resize2fs` 与 `sfdisk`，因此**可以直接在路由器上扩容**。
 
 `openwrt-install` 写盘后会**只读检测**并给出针对你磁盘的具体命令（不会自动改分区表）。
 例如 120 GiB 盘会输出：
 
 ```
-[INFO] 系统分区     : /dev/sda2  (1024 MiB, ext4)
+[INFO] 系统分区     : /dev/sda2  (2048 MiB, ext4)
 [WARN] 分区未占满磁盘: 可再扩约 121840 MiB
-[INFO]             分区 1024 MiB -> 122864 MiB
+[INFO]             分区 2048 MiB -> 122864 MiB
 ```
 
 ### 扩容步骤（ext4 版）

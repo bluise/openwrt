@@ -239,13 +239,17 @@ jobs:
           # 自定义文件通过 CUSTOM_FILES 传入, 原样覆盖进固件
           # (含 /etc/config/network 与 /usr/bin/openwrt-install)
           #
-          # 不使用 ROOTFS_PARTSIZE: 保持官方默认的 rootfs 分区(约 104 MiB),
-          # 镜像体积最小(约 13-17 MiB)。装到内置盘后由 openwrt-install 把分区
-          # 扩到整盘, 因此无需在镜像里预留大分区。若想"刷U盘直接跑"再加该参数。
+          # ROOTFS_PARTSIZE 单位为 MiB。设为 2048 => rootfs 分区 2 GiB。
+          # 目的: rootfs 上有较多可用空间(否则官方默认仅约 104 MiB)。
+          # 代价: 分区内多为零填充, 压缩后镜像约多 15 MiB 左右 —— 实测镜像
+          # 体积主要取决于内容(OpenClash 的 GeoSite.dat 就有 11M), 分区大小
+          # 影响相对有限。
+          # 装到内置盘后仍由 openwrt-install 把分区扩到整盘。
           make image \
             PROFILE="${PROFILE}" \
             PACKAGES="${PKG_LIST}" \
             FILES="${CUSTOM_FILES}" \
+            ROOTFS_PARTSIZE=2048 \
             -j"$(nproc)"
           echo "==> 产物:"
           ls -lh bin/targets/x86/64/*.img.gz
