@@ -142,8 +142,10 @@ jobs:
       - name: Build firmware
         run: |
           cd ${GITHUB_WORKSPACE}/openwrt
+          # 预编译 base-files, 避免 apk world 依赖读取 base-files.version 时的并发竞争
+          make package/base-files/compile V=s
           make -j$(nproc) V=s
-        timeout-minutes: 240
+        timeout-minutes: 280
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
