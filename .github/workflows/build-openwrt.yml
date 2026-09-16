@@ -177,6 +177,21 @@ jobs:
           echo "==> 共 ${#PKGS[@]} 个包:"
           printf '  %s\n' "${PKGS[@]}"
 
+      - name: Rebuild local package index
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          cd "${IB_DIR}"
+          # 必须显式重建本地包索引!
+          # 若省略此步, make image 内部自己触发的那次索引生成会漏掉刚放入
+          # packages/ 的第三方包, 且失败信息被 Makefile 的
+          #   `... >/dev/null 2>/dev/null || true`
+          # 完全吞掉, 表现为"构建成功但插件没装进去"(实测丢失
+          # luci-app-openclash 与 luci-app-oaf, 255 个包 vs 正确 285 个)。
+          make package_index
+          echo "==> 本地索引包含的包:"
+          ls packages/*.apk
+
       - name: Build firmware
         if: steps.release.outputs.build == 'true'
         env:
@@ -188,14 +203,13 @@ jobs:
           # FILES= 会把 files/ 下的内容原样覆盖进固件
           # (含 /etc/config/network 与 /usr/bin/openwrt-install)
           #
-          # ROOTFS_PARTSIZE=1024: 官方默认 rootfs 分区只有约 104 MiB, 装到内置盘后
-          # 可用空间很小。这里直接把分区做成 1024 MiB, 插上大盘即可用, 不必先扩容。
-          # 实测该参数生效且镜像正常(分区 2097152 扇区 = 1024 MiB)。
+          # 不使用 ROOTFS_PARTSIZE: 保持官方默认的 rootfs 分区(约 104 MiB),
+          # 镜像体积最小(约 13-17 MiB)。装到内置盘后由 openwrt-install 把分区
+          # 扩到整盘, 因此无需在镜像里预留大分区。若想"刷U盘直接跑"再加该参数。
           make image \
             PROFILE="${PROFILE}" \
             PACKAGES="${PKGS}" \
             FILES="${GITHUB_WORKSPACE}/files" \
-            ROOTFS_PARTSIZE=1024 \
             -j"$(nproc)"
           echo "==> 产物:"
           ls -lh bin/targets/x86/64/*.img.gz
