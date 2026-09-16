@@ -57,7 +57,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Resolve latest OpenWrt release
         id: release
@@ -278,7 +278,7 @@ jobs:
         if: steps.release.outputs.build == 'true'
         env:
           OPENWRT_RELEASE: ${{ steps.release.outputs.version }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: OpenWrt-x86_64-${{ env.OPENWRT_RELEASE }}
           path: |
@@ -290,7 +290,7 @@ jobs:
         if: steps.release.outputs.build == 'true'
         env:
           OPENWRT_RELEASE: ${{ steps.release.outputs.version }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: firmware
           name: OpenWrt ${{ env.OPENWRT_RELEASE }} 固件 (最新构建)
