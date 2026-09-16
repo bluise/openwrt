@@ -233,7 +233,7 @@ jobs:
           name: OpenWrt-x86_64-${{ env.OPENWRT_RELEASE }}
           path: |
             ${{ github.workspace }}/${{ env.IB_DIR }}/bin/targets/x86/64/*combined-efi*
-            ${{ github.workspace }}/${{ env.IB_DIR }}/bin/targets/x86/64/*.sha256sums
+            ${{ github.workspace }}/${{ env.IB_DIR }}/bin/targets/x86/64/*sha256sums*
           if-no-files-found: error
 
       - name: Publish Release
@@ -252,13 +252,13 @@ jobs:
             产物:
             - `*squashfs-combined-efi.img.gz` 只读根文件系统(抗写坏, 可恢复出厂)
             - `*ext4-combined-efi.img.gz` 可写根文件系统(可直接扩容)
-            - `*.sha256sums` 校验和
+            - `sha256sums` 校验和文件(注意: 实际文件名是 `sha256sums`, 不带点)
 
             已内置: OpenClash ${{ env.OPENCLASH_VER }}、OpenAppFilter ${{ env.OAF_VER }}、
             网卡驱动(r8169 / RTL8153 / MT7922)、LuCI 中文、`openwrt-install`、
             `resize2fs` + `sfdisk`(装到内置盘后扩容用)。
           files: |
             ${{ github.workspace }}/${{ env.IB_DIR }}/bin/targets/x86/64/*combined-efi*
-            ${{ github.workspace }}/${{ env.IB_DIR }}/bin/targets/x86/64/*.sha256sums
+            ${{ github.workspace }}/${{ env.IB_DIR }}/bin/targets/x86/64/*sha256sums*
           overwrite_files: true
           fail_on_unmatched_files: true
