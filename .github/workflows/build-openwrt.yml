@@ -77,7 +77,12 @@ jobs:
 
           # 定时触发: 只有新版本才构建(避免每周盲目重编); 代码推送: 总是构建
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            if git show-ref --verify --quiet refs/tags/firmware-built-"$LATEST"; then
+            # 必须显式拉取 tags: actions/checkout 默认浅克隆且不带 tags,
+            # 否则下面的 show-ref 永远失败, 会导致每周都盲目重编(机制失效)。
+            git fetch --tags --force --quiet origin || true
+            # 精确匹配. 不能用 firmware-built-${LATEST}(\.[0-9]+)? 这类模糊正则:
+            # 实测它会让 25.12.5 误匹配到 firmware-built-25.12.50 的 tag。
+            if git show-ref --verify --quiet "refs/tags/firmware-built-${LATEST}"; then
               echo "==> 该版本已构建过, 跳过"
               echo "build=false" >> "$GITHUB_OUTPUT"
             else
