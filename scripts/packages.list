@@ -1,0 +1,60 @@
+# ============================================================================
+# ImageBuilder 包清单 (每行一个包, # 开头为注释)
+#
+# 这些包名已对照 OpenWrt 25.12.5 x86/64 官方源逐一验证存在。
+# 注意与旧 .config 的差异(旧名在 25.12 中已不存在, 从源码编时才会被静默忽略):
+#   kmod-r8152            -> kmod-usb-net-rtl8152   (RTL8153 USB 网卡)
+#   linux-firmware-mt7921e -> kmod-mt7921-firmware  (MT7922 固件)
+#   linux-firmware-mediatek -> (由 kmod-mt7921-firmware 覆盖, 无需单独装)
+#   traceroute            -> 上游已无此包, 已移除
+#   luci-app-openclash / luci-app-oaf / appfilter / kmod-oaf
+#                         -> 由 workflow 从第三方 release 拉取预编译包, 不在此列出
+#   apk / apk-libs / luci-app-* 的基础依赖 -> 由 ImageBuilder 自动解析
+# ============================================================================
+
+# ---- 有线网卡: Realtek RTL8111/8168 (r8169) ----
+kmod-r8169
+
+# ---- USB 网卡: RTL8153 (r8152) + 常见 USB 网络协议 ----
+kmod-usb-net-rtl8152
+kmod-usb-net
+kmod-usb-net-cdc-ether
+kmod-usb-net-rndis
+kmod-usb-net-aqc111
+kmod-usb-serial
+kmod-mii
+
+# ---- USB 控制器与存储 ----
+kmod-usb2
+kmod-usb3
+kmod-usb-storage
+kmod-usb-storage-uas
+kmod-usb-storage-extras
+kmod-scsi-core
+
+# ---- 内置盘: SATA(AHCI) 与 NVMe ----
+kmod-ata-core
+kmod-ata-ahci
+kmod-nvme
+
+# ---- 无线网卡: MT7922 (mt7921e) + 固件 ----
+kmod-mt7921e
+kmod-mt7921-firmware
+
+# ---- 网络与调试工具 ----
+curl
+dnsmasq-full
+htop
+iperf3
+tcpdump
+ppp-mod-pppoe
+
+# ---- 内置盘安装后扩容所需(基础固件内没有这两个) ----
+resize2fs
+sfdisk
+
+# ---- LuCI 中文界面 + HTTPS ----
+luci
+luci-ssl
+luci-i18n-base-zh-cn
+luci-i18n-firewall-zh-cn
