@@ -59,53 +59,60 @@ GitHub Actions 在线自动构建 OpenWrt 25.12 x86_64 固件（基于官方 Ima
 
 ## 空间与扩容
 
-固件内嵌的 GPT 只描述镜像自身大小，**写入大容量硬盘后分区不会自动占满整盘** ——
-必须重写 GPT + 扩分区 + 扩文件系统三步。
+固件内嵌的 GPT 只描述镜像自身大小，**写入大容量硬盘后分区不会自动占满整盘**。
 
-本固件已把 rootfs 分区做到 **2048 MiB**（官方默认仅约 104 MiB），并且内置了
-`resize2fs` 与 `sfdisk`，因此**可以直接在路由器上扩容**。
+本固件的约定是：**rootfs 分区固定 2048 MiB**（官方默认仅约 104 MiB），
+磁盘剩余空间**保持未分配**，不扩满整盘、也不自动建数据分区。
+需要的话你可以自己把剩余空间建成数据分区（见文末）。
 
-`openwrt-install` 写盘后会**只读检测**并给出针对你磁盘的具体命令（不会自动改分区表）。
-例如 120 GiB 盘会输出：
+由于镜像内 rootfs 已经是 2 GiB，且已内置 `resize2fs` 与 `sfdisk`，
+正常情况下**装完无需任何操作**。`openwrt-install` 写盘后会只读检测并说明：
 
 ```
 [INFO] 系统分区     : /dev/sda2  (2048 MiB, ext4)
-[WARN] 分区未占满磁盘: 可再扩约 121840 MiB
-[INFO]             分区 2048 MiB -> 122864 MiB
+[INFO] rootfs 分区 2048 MiB (已达目标 2048 MiB) ✅
+[INFO] 剩余空间保持未分配, 未创建数据分区(本固件的约定)
 ```
 
-### 扩容步骤（ext4 版）
+### 什么时候需要扩容
 
-> 已在 `openwrt-25.12.5 combined-efi` 镜像上实测通过。squashfs 版扩容语义不同，脚本会另行提示。
-
-按脚本输出的命令执行即可。整盘设备指分区所属的那块盘（系统分区 `/dev/sda2`
-则整盘是 `/dev/sda`）。**起点必须与脚本显示的一致，否则会损坏文件系统**：
+只有当你刷入的镜像 rootfs 小于 2 GiB（例如官方原版镜像）时，脚本才会给出扩容命令：
 
 ```sh
 # 起点与尺寸由 openwrt-install 的检测结果给出，请照抄它的输出
-echo 'start=33280, size=251624927' | sfdisk -N 2 --force /dev/sda
+echo 'start=33280, size=4194304' | sfdisk -N 2 --force /dev/sda
 e2fsck -fy /dev/sda2
 resize2fs /dev/sda2
 ```
 
-`sfdisk -N` 会自动修正 GPT：把备份分区表移到盘尾、更新保护性 MBR、抬高可用末 LBA，
-无需手工计算扇区。若提示设备忙，给它加 `--no-reread`，之后用 `partx -u /dev/sda`
-让内核重读分区表。
+**起点必须与脚本显示的一致，否则会损坏文件系统。** `sfdisk -N` 会自动修正 GPT
+（把备份分区表移到盘尾、更新保护性 MBR、抬高可用末 LBA），无需手工计算扇区；
+若提示设备忙，追加 `--no-reread`，之后用 `partx -u /dev/sda` 让内核重读。
 
-重启后用 `df -h /` 确认根分区已变为整盘大小。
+> squashfs 版根文件系统为只读，扩容语义不同（需把新空间做成 overlay），脚本会另行提示。
 
-## 仓库结构
+### 想用剩余空间建数据分区（可选，手动）
 
-| 路径 | 作用 |
-|------|------|
-| `.github/workflows/build-openwrt.yml` | ImageBuilder 构建流程 |
-| `scripts/packages.list` | 固件包含的软件包清单（唯一来源） |
-| `files/` | 注入固件的自定义文件（`/etc/config/network`、`/usr/bin/openwrt-install`） |
+`openwrt-install` 不会自动做这件事，按下面步骤自行操作（把 `/dev/sda` 换成实际盘符；
+起始扇区请取 `openwrt-install` 输出里的 rootfs 末端 + 1）：
 
-## 注意事项
+```sh
+# 建分区 3（起始扇区留出前两个分区，尺寸留 33 个扇区给备份 GPT）
+echo 'start=4227584, size=<根据磁盘大小填写>' | sfdisk -N 3 --force /dev/sda
+mkfs.ext4 -F /dev/sda3
+blkid /dev/sda3                      # 记下 UUID
+mkdir -p /mnt/data
+mount /dev/sda3 /mnt/data
+```
 
-- **镜像版本与 OAF 内核模块必须匹配**：OAF 的预编译内核模块按特定内核版本编译，
-  版本不一致会因 ABI 不匹配而安装失败。workflow 会先校验并在不匹配时明确报错。
-  已知组合：`OAF v7.0.1` ↔ `25.12.5`(内核 6.12.94)，`v6.1.7` ↔ `25.12.0`(6.12.71)。
-- 原 `diy-part1.sh` / `diy-part2.sh` / `.config` 已移除：第三方源与自定义文件由
-  workflow 和 `files/` 直接处理，`scripts/packages.list` 取代了 `.config` 的包选择。
+开机自动挂载：在 `/etc/config/fstab` 写入
+
+```
+config mount
+    option target   '/mnt/data'
+    option uuid     '<上面的UUID>'
+    option enabled  '1'
+```
+
+然后 `/etc/init.d/fstab enable && /etc/init.d/fstab restart`。
+用 UUID 而非 `/dev/sda3` 更稳妥（设备名可能变化）。

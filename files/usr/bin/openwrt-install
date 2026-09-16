@@ -105,8 +105,9 @@ countdown() {
 # 探测全部基于 BusyBox 自带工具(dd/od/grep), 不依赖已不在固件中的 lsblk/blkid。
 
 SECTOR=512
-# 剩余空间超过这么多扇区(1 MiB)才认为值得扩容
-MIN_GROW_SECTORS=2048
+# rootfs 分区的目标尺寸(MiB)。本固件镜像内 rootfs 已是该尺寸;
+# 脚本不会把 rootfs 扩满整盘, 磁盘剩余空间保持未分配。
+ROOT_PART_TARGET_MIB=2048
 
 # 从磁盘读一个小端 u64 (status=none 必须加: busybox dd 默认把统计打到 stdout)
 le_u64() {
@@ -202,21 +203,13 @@ post_install_space_report() {
   log_info "系统分区     : ${dev}${BEST_IDX}  ($(sectors_to_mib "$BEST_SIZE") MiB, ${BEST_FS})"
 
   if [ -z "$fsmax" ]; then
-    log_warn "读不到磁盘总容量, 无法判断是否可以扩容"
+    log_warn "读不到磁盘总容量, 无法判断空间"
     return 0
   fi
 
-  # 扩到盘尾后的分区尺寸 = 可用末LBA - 起始 + 1
-  newsize=$(( fsmax - BEST_START + 1 ))
-  grow=$(( newsize - BEST_SIZE ))
-  if [ "$grow" -lt "$MIN_GROW_SECTORS" ] 2>/dev/null; then
-    log_info "分区已占满磁盘 (仅可再扩 ${grow} 扇区), 无需扩容"
-    return 0
-  fi
-
-  log_warn "分区未占满磁盘: 可再扩约 $(sectors_to_mib "$grow") MiB"
-  log_info "            分区 $(sectors_to_mib "$BEST_SIZE") MiB -> $(sectors_to_mib "$newsize") MiB"
-  log_info "            (分区尺寸; 文件系统实际可用空间会略小, 扩容后用 df -h / 查看)"
+  # 本固件的设计: rootfs 固定为 ROOT_PART_TARGET_MIB(镜像内已是 2 GiB),
+  # 剩余空间保持未分配 —— 不扩满整盘, 也不自动建数据分区。
+  target_secs=$(( ROOT_PART_TARGET_MIB * 2048 ))
 
   if [ "$BEST_FS" = "squashfs" ]; then
     cat <<EOF
@@ -229,52 +222,36 @@ EOF
     return 0
   fi
 
-  # 缺少工具时给出安装提示(注意 resize2fs 在基础固件中并不存在)
-  # resize2fs/sfdisk 在基础固件中都不存在, 均为可单独安装的软件包
   missing=""
   command -v sfdisk    >/dev/null 2>&1 || missing="$missing sfdisk"
   command -v resize2fs >/dev/null 2>&1 || missing="$missing resize2fs"
   [ -n "$missing" ] && log_warn "缺少工具:$missing"
 
-  cat <<EOF
+  if [ "$BEST_SIZE" -lt "$target_secs" ] 2>/dev/null; then
+    need=$(( target_secs - BEST_SIZE ))
+    log_warn "rootfs 分区小于目标值: 可扩约 $(sectors_to_mib "$need") MiB"
+    log_info "            分区 $(sectors_to_mib "$BEST_SIZE") MiB -> $(sectors_to_mib "$target_secs") MiB"
+    cat <<EOF
 
-  ── 扩容步骤 ────────────────────────────────────────
-  以下命令已在 openwrt-25.12 combined-efi 镜像上实测通过:
-  sfdisk -N 会自动修正 GPT(移备份表到盘尾/更新保护性MBR/抬高可用末LBA),
-  无需手工计算扇区, 也不用 (25.12 源里没有的) sgdisk/parted。
-
-  [1] 安装工具 (基础固件内没有 resize2fs):
-EOF
-  if [ -n "$missing" ]; then
-    echo "        apk update && apk add resize2fs sfdisk"
-  else
-    echo "        (工具已就绪)"
-  fi
-  cat <<EOF
-
-  [2] 扩分区 ${BEST_IDX} 到盘尾 (起点 ${BEST_START} 保持不变):
-        echo 'start=${BEST_START}, size=${newsize}' | sfdisk -N ${BEST_IDX} --force ${dev}
-        # 若提示设备忙, 追加 --no-reread, 之后用 partx -u ${dev} 让内核重读
-
-  [3] 扩文件系统:
+  ── 扩容步骤 (起点 ${BEST_START} 必须保持不变, 否则会损坏文件系统) ──
+        echo 'start=${BEST_START}, size=${target_secs}' | sfdisk -N ${BEST_IDX} --force ${dev}
         e2fsck -fy ${dev}${BEST_IDX}
         resize2fs ${dev}${BEST_IDX}
-
-  ⚠ 第 [2] 步会重建分区 ${BEST_IDX}。起点 ${BEST_START} 必须与上面显示的值一致,
-    否则文件系统会损坏 —— 请先核对再执行。
-    若内核未立即反映新分区大小, 重启一次后再做第 [3] 步。
-
-  ── 也可以在 Linux 主机上做 ─────────────────────────
-  把盘接到 Linux 主机(或 U 盘启动 Linux), 把 ${dev} 换成实际盘符如 /dev/sdX:
-        echo 'start=${BEST_START}, size=${newsize}' | sfdisk -N ${BEST_IDX} --force /dev/sdX
-        e2fsck -fy /dev/sdX${BEST_IDX}
-        resize2fs /dev/sdX${BEST_IDX}
-  主机上工具齐全, 比在路由上更稳妥; 但务必核对盘符与分区号 ${BEST_IDX}。
+    若内核未立即反映新分区大小, 重启后再执行 e2fsck/resize2fs。
+    sfdisk -N 会自动修正 GPT(移备份表到盘尾/更新保护性MBR/抬高可用末LBA);
+    若提示设备忙, 追加 --no-reread 再用 partx -u ${dev} 让内核重读。
+    也可以在 Linux 主机上做: 把盘接到主机(或 U 盘启动 Linux),
+    把 ${dev} 换成实际盘符(如 /dev/sdX)后执行同样命令。
   ────────────────────────────────────────────────────
 EOF
-  command -v resize2fs >/dev/null 2>&1 || \
-    log_warn "固件内没有 resize2fs: 只扩分区不会自动扩大文件系统, 必须完成上面第 [3] 步"
-  log_warn "以上操作会修改分区表, 请在确认盘符与分区号后再执行"
+  else
+    log_info "rootfs 分区 $(sectors_to_mib "$BEST_SIZE") MiB (已达目标 ${ROOT_PART_TARGET_MIB} MiB) ✅"
+    log_info "剩余空间保持未分配, 未创建数据分区(本固件的约定)"
+  fi
+
+  if [ -n "$missing" ]; then
+    log_warn "固件内缺少$missing: 上面依赖它们的步骤需先安装, 或改在 Linux 主机上执行"
+  fi
   return 0
 }
 
