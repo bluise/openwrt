@@ -142,8 +142,10 @@ jobs:
       - name: Build firmware
         run: |
           cd ${GITHUB_WORKSPACE}/openwrt
-          # 预编译 base-files, 避免 apk world 依赖读取 base-files.version 时的并发竞争
-          make package/base-files/compile V=s
+          # 必须走完整 world 流程 (tools -> toolchain -> target -> package)。
+          # 不能单独提前 `make package/base-files/compile`: 那会绕过 tools 阶段,
+          # 此时 staging_dir/host/bin/sed 尚未安装, 导致 host 包 lua 的 configure
+          # 报 "staging_dir/host/bin/sed: No such file or directory" (Error 127)。
           make -j$(nproc) V=s
         timeout-minutes: 280
 
