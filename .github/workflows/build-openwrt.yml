@@ -199,8 +199,14 @@ jobs:
         run: |
           set -euo pipefail
           cd "${IB_DIR}"
-          PKGS="$(tr '\n' ' ' < /tmp/pkgs.txt)"
-          # FILES= 会把 files/ 下的内容原样覆盖进固件
+          PKG_LIST="$(tr '\n' ' ' < /tmp/pkgs.txt)"
+          CUSTOM_FILES="${GITHUB_WORKSPACE}/files"
+          # 变量名务必避开 OpenWrt 自身使用的 PKGS / FILES:
+          # 用 FILES=... 调 make 后, OpenWrt 的 rules.mk 会把 shell 变量
+          # FILES 覆盖为空, 导致后续 make 语义错乱 —— 实测表现为
+          # PACKAGES 列表末尾的包被静默丢弃、packages.adb 又变成不存在,
+          # 最终 luci-app-openclash 与 luci-app-oaf 装不进去。
+          # 自定义文件通过 CUSTOM_FILES 传入, 原样覆盖进固件
           # (含 /etc/config/network 与 /usr/bin/openwrt-install)
           #
           # 不使用 ROOTFS_PARTSIZE: 保持官方默认的 rootfs 分区(约 104 MiB),
@@ -208,8 +214,8 @@ jobs:
           # 扩到整盘, 因此无需在镜像里预留大分区。若想"刷U盘直接跑"再加该参数。
           make image \
             PROFILE="${PROFILE}" \
-            PACKAGES="${PKGS}" \
-            FILES="${GITHUB_WORKSPACE}/files" \
+            PACKAGES="${PKG_LIST}" \
+            FILES="${CUSTOM_FILES}" \
             -j"$(nproc)"
           echo "==> 产物:"
           ls -lh bin/targets/x86/64/*.img.gz
