@@ -367,12 +367,25 @@ set_nic_mode() {
     MODE_DESC="当前: 单网卡 (全部作 LAN)"
   fi
 
-  CHOICE=$(whiptail --title "网口模式" --menu \
-    "检测到物理网口: $NICS\n$MODE_DESC\n\n请选择:" 18 76 3 \
-    "single" "单网卡模式: 唯一网口作为 LAN (直接可管理)" \
-    "dual"   "双网卡模式: 第一个为 WAN(DHCP), 其余为 LAN" \
-    "auto"   "自动按网口数量判断" \
-    3>&1 1>&2 2>&3) || return 0
+  if [ -n "$HAS_WT" ]; then
+    CHOICE=$(whiptail --title "网口模式" --menu \
+      "检测到物理网口: $NICS\n$MODE_DESC\n\n请选择:" 18 76 3 \
+      "single" "单网卡模式: 唯一网口作为 LAN (直接可管理)" \
+      "dual"   "双网卡模式: 第一个为 WAN(DHCP), 其余为 LAN" \
+      "auto"   "自动按网口数量判断" \
+      3>&1 1>&2 2>&3) || return 0
+  else
+    echo ""
+    echo "检测到物理网口: $NICS"
+    echo "$MODE_DESC"
+    echo "  1) 单网卡模式 (唯一网口作为 LAN)"
+    echo "  2) 双网卡模式 (第一个为 WAN, 其余为 LAN)"
+    echo "  3) 自动判断"
+    printf '请输入编号并回车 [3]: '; read -r NT
+    case "${NT:-3}" in
+      1) CHOICE=single ;; 2) CHOICE=dual ;; *) CHOICE=auto ;;
+    esac
+  fi
 
   case "$CHOICE" in
     auto)
@@ -431,6 +444,58 @@ show_interfaces() {
   [ -n "$TXT" ] || TXT=$(ifconfig -a 2>/dev/null | head -20)
   LAN=$(uci -q get network.lan.ipaddr 2>/dev/null)
   msg "网络接口" "LAN 管理地址: ${LAN:-未知}\n(设备名 eth0/eth1 等, 取决于网卡)\n\n$TXT"
+}
+
+# 纯文本菜单兜底: 没有 whiptail 或没有终端时使用。
+# 仍然是"选择"而不是记命令 —— 输入编号回车即可。
+text_menu() {
+  while :; do
+    cat <<EOF
+
+======== OpenWrt 安装助手 ========
+  1) 安装系统到内置硬盘 (会清空目标盘!)
+  2) 查看磁盘与空间状态
+  3) 修改 LAN 口 IP 地址
+  4) 修改 root 密码
+  5) 查看网络接口
+  6) 显示扩容命令(如需要)
+  7) 设置网口模式(单网卡/双网卡)
+  0) 退出
+==================================
+EOF
+    printf '请输入编号并回车: '
+    read -r N
+    case "$N" in
+      1)
+        printf '确认把固件写入内置硬盘(会清空目标盘)? [y/N] '; read -r A
+        case "$A" in y|Y) do_install || true ;; *) echo "已取消" ;; esac
+        ;;
+      2|6)
+        if find_target_disk >/dev/null 2>&1; then
+          post_install_space_report "$TARGET" || true
+        else
+          echo "未找到可用的内置硬盘。"
+        fi
+        ;;
+      3)
+        printf '请输入新的 LAN 口 IP: '; read -r NIP
+        if [ -n "$NIP" ]; then
+          if valid_ipv4 "$NIP"; then
+            uci set network.lan.ipaddr="$NIP" && uci commit network && \
+              /etc/init.d/network reload >/dev/null 2>&1 || true
+            echo "LAN 口 IP 已改为 $NIP (如连接断开请访问新地址)"
+          else
+            echo "不是合法的 IPv4 地址: $NIP"
+          fi
+        fi
+        ;;
+      4) passwd root ;;
+      5) show_interfaces ;;
+      7) set_nic_mode || true ;;
+      0|"") echo "已退出"; return 0 ;;
+      *) echo "无效编号: $N" ;;
+    esac
+  done
 }
 
 # 主菜单
@@ -545,13 +610,11 @@ main() {
       log_err "未知选项: $1"; usage; exit 2 ;;
   esac
 
-  # 默认: 有 whiptail 就进菜单, 否则退回一键安装(保持行为可预期)
+  # 默认进菜单: 有 whiptail 用图形菜单(方向键选择), 否则用同内容的编号菜单
   if [ -n "$HAS_WT" ]; then
     main_menu
   else
-    log_warn "未检测到 whiptail, 无法显示菜单, 直接进入安装流程"
-    log_warn "(如需菜单请安装: apk add whiptail)"
-    do_install "$@"
+    text_menu
   fi
 }
 
