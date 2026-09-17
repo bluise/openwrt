@@ -53,6 +53,9 @@ ppp-mod-pppoe
 resize2fs
 sfdisk
 
+# ---- 交互式菜单(openwrt-install 的菜单界面需要 whiptail) ----
+whiptail
+
 # ---- LuCI 中文界面 + HTTPS ----
 luci
 luci-ssl

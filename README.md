@@ -14,7 +14,7 @@ GitHub Actions 在线自动构建 OpenWrt 25.12 x86_64 固件（基于官方 Ima
 - **LuCI 中文界面 + HTTPS**
 - **rootfs 分区 2048 MiB**（官方默认仅约 104 MiB，见下文「空间与扩容」）
 - **内置 `resize2fs` + `sfdisk`**，装到内置盘后可直接扩容
-- **内置 `openwrt-install`** 一键安装到内置硬盘命令
+- **内置 `openwrt-install`** 交互式安装助手（装到内置硬盘 / 改 LAN IP / 改密码 / 查看磁盘与网口）
 
 ## 网络默认
 
@@ -87,18 +87,37 @@ Windows：用 **Rufus** 选 **DD 模式**（不要用 ISO 模式，会破坏分�
 openwrt-install
 ```
 
-脚本会：
-1. 自动识别内置 SATA/NVMe 硬盘（排除启动 U 盘）
+会显示**交互式菜单**（类似 iStoreOS 的 `quickstart`）：
+
+```
+┌──────────── OpenWrt 安装助手 ────────────┐
+│  1) 安装系统到内置硬盘 (会清空目标盘!)    │
+│  2) 查看磁盘与空间状态                    │
+│  3) 修改 LAN 口 IP 地址                   │
+│  4) 修改 root 密码                        │
+│  5) 查看网络接口                          │
+│  6) 显示扩容命令(如需要)                  │
+│  0) 退出                                  │
+└───────────────────────────────────────────┘
+```
+
+选 `1` 安装，脚本会：
+1. 自动识别内置 SATA/NVMe 硬盘（**排除启动 U 盘**）
 2. 自动查找 U 盘上的固件镜像
 3. 显示目标盘并**倒计时 5 秒**（此时 Ctrl+C 可取消）—— **会清空目标盘所有数据**
 4. 写入镜像
 5. 只读检测空间并说明结果
 
-指定固件路径或确认盘位：
+### 命令行用法（非交互）
 
 ```sh
-openwrt-install /path/to/openwrt-*-combined-efi.img.gz
+openwrt-install --no-menu          # 跳过菜单, 直接一键安装
+openwrt-install --change-ip        # 只改 LAN 口 IP
+openwrt-install -h                 # 查看全部用法
+openwrt-install --no-menu /path/to/openwrt-*.img.gz   # 指定固件
 ```
+
+> 菜单界面由 `whiptail` 提供（已内置）。若在没有终端的环境调用，脚本会自动回退为纯文本交互，不会卡住。
 
 ### 五、重启与首次登录
 
@@ -125,6 +144,25 @@ passwd
 ```
 
 若显示的是扩容提示，见下一节。
+
+## 修改 LAN 口 IP
+
+菜单里选 `3`（或执行 `openwrt-install --change-ip`），输入新 IP 即可：
+
+```
+请输入新的 LAN 口 IP 地址 (当前 10.0.0.1): 192.168.2.1
+```
+
+脚本会校验地址合法性，确认后写入 `uci` 并热重载网络。**修改后当前连接会断开**，
+需要访问新地址（或让电脑重新获取 DHCP）。
+
+手动等价操作：
+
+```sh
+uci set network.lan.ipaddr='192.168.2.1'
+uci commit network
+/etc/init.d/network reload
+```
 
 ## 空间与扩容
 

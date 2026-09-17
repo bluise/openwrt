@@ -255,21 +255,213 @@ EOF
   return 0
 }
 
-# ---------- main ----------
-find_target_disk
-find_firmware "$@"
-countdown
+# =============================================
+# 交互式菜单 (whiptail)
+# =============================================
+# 有 whiptail 时用图形菜单; 没有则回退为纯文本交互, 保证脚本仍可用。
+# 非交互场景(脚本调用/测试)可加 --no-menu 直接执行安装流程。
 
-log_info "解压并写入镜像..."
-if command -v gunzip >/dev/null 2>&1; then
-  gunzip -c "$FW" | dd of="$TARGET" bs=4M status=progress conv=fsync
-else
-  dd if="$FW" of="$TARGET" bs=4M status=progress conv=fsync
+# 菜单需要: (1) 装了 whiptail (2) 有可用终端。
+# 只判断命令存在是不够的 —— 无终端时 whiptail 会直接失败。
+HAS_WT=""
+if command -v whiptail >/dev/null 2>&1; then
+  if [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then
+    HAS_WT=1
+    TERM=${TERM:-linux}
+    export TERM
+  fi
 fi
-sync
 
-# 只读探测 + 扩容指引 (不自动改分区表)
-post_install_space_report "$TARGET" || true
+msg() { # $1=标题 $2=内容
+  if [ -n "$HAS_WT" ]; then
+    whiptail --title "$1" --msgbox "$2" 18 74
+  else
+    echo "===== $1 ====="; echo "$2"; echo; printf '按回车继续...'; read _x
+  fi
+}
 
-log_info "安装完成! 请拔掉U盘重启, 首次启动约需2-3分钟."
-log_info "默认管理地址: http://10.0.0.1 (LAN口 eth1)"
+confirm() { # $1=标题 $2=内容 -> 0=确认
+  if [ -n "$HAS_WT" ]; then
+    whiptail --title "$1" --yesno "$2" 16 74
+  else
+    echo "===== $1 ====="; echo "$2"; printf '确认执行? [y/N] '; read _a
+    case "$_a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+  fi
+}
+
+input_box() { # $1=标题 $2=提示 $3=默认值 -> 结果打印到 stdout
+  if [ -n "$HAS_WT" ]; then
+    whiptail --title "$1" --inputbox "$2" 12 74 "$3" 3>&1 1>&2 2>&3
+  else
+    printf '%s [%s]: ' "$2" "$3" >&2
+    read _v
+    [ -n "$_v" ] || _v=$3
+    printf '%s' "$_v"
+  fi
+}
+
+# 校验 IPv4 点分十进制 (借内核的 inet_pton 判断, 避免手写解析出漏洞)
+valid_ipv4() {
+  printf '%s' "$1" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || return 1
+  python3 -c "import socket,sys; socket.inet_aton(sys.argv[1])" "$1" 2>/dev/null && return 0
+  # 没有 python3 时用内核 inet_pton
+  ipcalc.sh "$1" >/dev/null 2>&1
+}
+
+# 修改 LAN 口 IP (对应 iStoreOS quickstart 里的改 IP 功能)
+change_lan_ip() {
+  CUR=$(uci -q get network.lan.ipaddr 2>/dev/null)
+  [ -n "$CUR" ] || CUR=10.0.0.1
+  NEW=$(input_box "修改 LAN 口 IP" "请输入新的 LAN 口 IP 地址 (当前 $CUR):" "$CUR") || return 0
+  [ -n "$NEW" ] || return 0
+  if ! valid_ipv4 "$NEW"; then
+    msg "错误" "'$NEW' 不是合法的 IPv4 地址。"
+    return 1
+  fi
+  if confirm "确认修改" "将把 LAN 口 IP 改为 $NEW\n\n注意: 修改后当前连接会断开, 需要访问新地址、或重新获取 DHCP。\n是否继续?"; then
+    uci set network.lan.ipaddr="$NEW" || { msg "错误" "写入 uci 失败"; return 1; }
+    uci commit network
+    if [ -n "$HAS_WT" ]; then
+      whiptail --title "已修改" --infobox "正在应用网络配置...\n\n新地址: http://$NEW" 10 60
+    fi
+    /etc/init.d/network reload >/dev/null 2>&1 || service network reload >/dev/null 2>&1 || true
+    msg "完成" "LAN 口 IP 已改为: $NEW\n\n请用浏览器访问  http://$NEW\n若当前连接已断开, 请到新网段重新连接。"
+  fi
+}
+
+# 修改 root 密码
+change_password() {
+  if confirm "修改密码" "接下来会调用 passwd, 请按提示输入两次新密码。\n\n是否继续?"; then
+    passwd root || msg "提示" "密码修改未完成或已取消。"
+  fi
+}
+
+# 显示网络接口与地址
+show_interfaces() {
+  TXT=$(ip -4 addr show 2>/dev/null | awk '/^[0-9]+:/{iface=$2} /inet /{print iface" "$2}' | sed 's/:$//' | head -20)
+  [ -n "$TXT" ] || TXT=$(ifconfig -a 2>/dev/null | head -20)
+  LAN=$(uci -q get network.lan.ipaddr 2>/dev/null)
+  msg "网络接口" "LAN 管理地址: ${LAN:-未知}\n(设备名 eth0/eth1 等, 取决于网卡)\n\n$TXT"
+}
+
+# 主菜单
+main_menu() {
+  while :; do
+    CHOICE=$(whiptail --title "OpenWrt 安装助手" --menu \
+      "请选择要执行的操作:" 19 74 7 \
+      "1" "安装系统到内置硬盘 (会清空目标盘!)" \
+      "2" "查看磁盘与空间状态" \
+      "3" "修改 LAN 口 IP 地址" \
+      "4" "修改 root 密码" \
+      "5" "查看网络接口" \
+      "6" "显示扩容命令(如需要)" \
+      "0" "退出" \
+      3>&1 1>&2 2>&3) || return 0
+    case "$CHOICE" in
+      1)
+        if confirm "确认安装" "即将把固件写入内置硬盘, 目标盘上的所有数据都会被清空。\n\n是否继续?"; then
+          do_install || true
+        fi
+        ;;
+      2|6)
+        if find_target_disk >/dev/null 2>&1; then
+          TMPF=$(mktemp 2>/dev/null || echo /tmp/.ospace.$$)
+          post_install_space_report "$TARGET" >"$TMPF" 2>&1 || true
+          TXT=$(sed 's/\x1b\[[0-9;]*m//g' "$TMPF" 2>/dev/null)
+          rm -f "$TMPF"
+          if [ "$CHOICE" = "2" ]; then
+            msg "磁盘与空间状态" "${TXT:-未获取到信息}"
+          else
+            msg "扩容命令" "${TXT:-当前无需扩容}"
+          fi
+        else
+          msg "错误" "未找到可用的内置硬盘。"
+        fi
+        ;;
+      3) change_lan_ip || true ;;
+      4) change_password ;;
+      5) show_interfaces ;;
+      0|"") return 0 ;;
+    esac
+  done
+}
+
+# ---------- 安装流程 ----------
+do_install() {
+  find_target_disk || return 1
+  find_firmware "$@" || return 1
+  countdown
+
+  log_info "解压并写入镜像..."
+  if command -v gunzip >/dev/null 2>&1; then
+    gunzip -c "$FW" | dd of="$TARGET" bs=4M conv=fsync
+  else
+    dd if="$FW" of="$TARGET" bs=4M conv=fsync
+  fi
+  sync
+
+  # 只读探测 (不自动改分区表)
+  post_install_space_report "$TARGET" || true
+
+  log_info "安装完成! 请拔掉U盘重启, 首次启动约需2-3分钟."
+  log_info "默认管理地址: http://10.0.0.1 (LAN口 eth1)"
+  return 0
+}
+
+# ---------- 入口 ----------
+usage() {
+  cat <<EOF
+用法: openwrt-install [选项] [固件路径]
+
+  (无参数)        显示交互式菜单 (推荐)
+  --no-menu       跳过菜单, 直接安装到内置硬盘(原一键安装行为)
+  --change-ip     直接进入"修改 LAN 口 IP"功能(对应 quickstart 的改 IP)
+  -h, --help      显示本帮助
+
+示例:
+  openwrt-install                                  # 菜单模式
+  openwrt-install --no-menu                        # 一键安装(自动找固件/目标盘)
+  openwrt-install --no-menu /mnt/sda1/xxx.img.gz   # 指定固件
+  openwrt-install --change-ip                      # 只改 IP
+EOF
+}
+
+main() {
+  # 帮助与非法选项不需要 root, 先处理
+  case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    -*) case "${1:-}" in
+          --change-ip|--no-menu) : ;;
+          *) log_err "未知选项: $1"; usage; exit 2 ;;
+        esac ;;
+  esac
+
+  # 写盘/改网络都需要 root
+  if [ "$(id -u 2>/dev/null || echo 0)" != "0" ]; then
+    log_err "需要 root 权限运行 (当前 uid 非 0)。请用 root 登录后重试。"
+    echo "(查看用法: $0 --help)"
+    exit 1
+  fi
+
+  case "${1:-}" in
+    --change-ip)
+      shift 2>/dev/null || true
+      change_lan_ip; exit 0 ;;
+    --no-menu)
+      shift 2>/dev/null || true
+      do_install "$@"; exit $? ;;
+    -*)
+      log_err "未知选项: $1"; usage; exit 2 ;;
+  esac
+
+  # 默认: 有 whiptail 就进菜单, 否则退回一键安装(保持行为可预期)
+  if [ -n "$HAS_WT" ]; then
+    main_menu
+  else
+    log_warn "未检测到 whiptail, 无法显示菜单, 直接进入安装流程"
+    log_warn "(如需菜单请安装: apk add whiptail)"
+    do_install "$@"
+  fi
+}
+
+main "$@"
