@@ -14,7 +14,7 @@ GitHub Actions 在线自动构建 OpenWrt 25.12 x86_64 固件（基于官方 Ima
 - **LuCI 中文界面 + HTTPS**
 - **rootfs 分区 2048 MiB**（官方默认仅约 104 MiB，见下文「空间与扩容」）
 - **内置 `resize2fs` + `sfdisk`**，装到内置盘后可直接扩容
-- **内置 `openwrt-install`** 交互式安装助手（装到内置硬盘 / 改 LAN IP / 改密码 / 网口模式 / 查看磁盘与网口）
+- **内置 `openwrt` 命令**（`openwrt-install` 的快捷入口）打开交互式安装助手（装到内置硬盘 / 改 LAN IP / 改密码 / 网口模式 / 查看磁盘与网口）
 
 ## 网络默认
 
@@ -84,8 +84,10 @@ Windows：用 **Rufus** 选 **DD 模式**（不要用 ISO 模式，会破坏分�
 系统起来后（默认地址 `http://10.0.0.1`），SSH 或接显示器登录，执行：
 
 ```sh
-openwrt-install
+openwrt
 ```
+
+（`openwrt` 是快捷入口，等价于 `openwrt-install`；也可用后者，或 `openwrt-install --no-menu` 直接安装）
 
 会显示**交互式菜单**（类似 iStoreOS 的 `quickstart`）：
 
@@ -112,6 +114,7 @@ openwrt-install
 ### 命令行用法（非交互）
 
 ```sh
+openwrt                            # 打开菜单(带方向键选择)
 openwrt-install --no-menu          # 跳过菜单, 直接一键安装
 openwrt-install --change-ip        # 只改 LAN 口 IP
 openwrt-install -h                 # 查看全部用法

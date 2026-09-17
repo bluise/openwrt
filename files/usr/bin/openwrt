@@ -1,0 +1,21 @@
+#!/bin/sh
+# =============================================
+# openwrt : 快捷入口, 直接打开安装助手菜单
+#
+# 等价于 openwrt-install (无参数时进菜单)。
+# 目的: 输入更短 —— 启动机器后敲 openwrt 即可用方向键选择菜单。
+#
+# 其它用法仍走 openwrt-install:
+#   openwrt-install --no-menu    直接一键安装
+#   openwrt-install --change-ip  只改 LAN IP
+#   openwrt-install -h           全部用法
+# =============================================
+
+SELF=openwrt-install
+
+if ! command -v "$SELF" >/dev/null 2>&1; then
+  echo "找不到 $SELF, 请确认系统安装完整。" >&2
+  exit 1
+fi
+
+exec "$SELF" "$@"
