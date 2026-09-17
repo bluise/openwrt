@@ -227,6 +227,24 @@ jobs:
           echo "==> 本地索引包含的包:"
           ls packages/*.apk
 
+      - name: Prepare custom files
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # files/ 会被原样注入固件, 因此脚本必须带执行位, 否则刷完固件后
+          # 直接执行会报 "Permission denied"。
+          #
+          # 必须在这里显式 chmod: 本仓库因克隆环境问题 core.filemode=false,
+          # git 不记录权限位, 新增文件会被提交为 100644 —— 实测已发生过一次
+          # (files/usr/bin/openwrt 被固化进固件后权限为 644)。
+          chmod -R u+rwX,go+rX files || true
+          for d in files/usr/bin files/usr/sbin files/etc/init.d; do
+            [ -d "$d" ] || continue
+            find "$d" -type f -exec chmod 755 {} +
+            echo "==> $d:"
+            ls -l "$d"
+          done
+
       - name: Build firmware
         if: steps.release.outputs.build == 'true'
         env:
