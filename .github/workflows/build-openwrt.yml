@@ -24,7 +24,6 @@ on:
       - '.github/workflows/**'
       - 'files/**'
       - 'scripts/**'
-      - '.config'
       - 'README.md'
   workflow_dispatch:
     inputs:
@@ -254,11 +253,13 @@ jobs:
           cd "${IB_DIR}"
           PKG_LIST="$(tr '\n' ' ' < /tmp/pkgs.txt)"
           CUSTOM_FILES="${GITHUB_WORKSPACE}/files"
-          # 变量名务必避开 OpenWrt 自身使用的 PKGS / FILES:
-          # 用 FILES=... 调 make 后, OpenWrt 的 rules.mk 会把 shell 变量
-          # FILES 覆盖为空, 导致后续 make 语义错乱 —— 实测表现为
-          # PACKAGES 列表末尾的包被静默丢弃、packages.adb 又变成不存在,
-          # 最终 luci-app-openclash 与 luci-app-oaf 装不进去。
+          # 变量名注意区分 shell 变量与 make 变量:
+          # ImageBuilder 接收自定义文件的 make 变量**只能叫 FILES**, 不可改名;
+          # 但不要在 shell 里定义一个名叫 FILES 的变量再 export ——
+          # OpenWrt 的 rules.mk 会把它当 make 变量吃掉并覆盖为空, 导致后续
+          # make 语义错乱(实测表现: PACKAGES 末尾的包被静默丢弃、
+          # packages.adb 又变成不存在, 最终 openclash/oaf 装不进去)。
+          # 所以这里先存进 shell 变量 CUSTOM_FILES, 只在 make 命令行上传 FILES=...
           # 自定义文件通过 CUSTOM_FILES 传入, 原样覆盖进固件
           # (含 /etc/config/network 与 /usr/bin/openwrt-install)
           #

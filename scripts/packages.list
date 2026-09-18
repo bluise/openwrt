@@ -53,6 +53,13 @@ ppp-mod-pppoe
 resize2fs
 sfdisk
 
+# ---- 数据分区自动挂载 ----
+# 提供 /etc/init.d/fstab 与 /etc/config/fstab。缺省镜像里没有这个包,
+# README「想用剩余空间建数据分区」一节要靠它才能开机自动挂载,
+# 否则 /etc/config/fstab 不存在、/etc/init.d/fstab 也不存在。
+# (e2fsck / mkfs.ext4 由缺省已装的 e2fsprogs 提供, 无需额外加。)
+block-mount
+
 # ---- 交互式菜单(openwrt-install 的菜单界面需要 whiptail) ----
 whiptail
 
