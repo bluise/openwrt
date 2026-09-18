@@ -29,7 +29,7 @@ log_err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # 版本号: 每次改动都换 —— 日志第一行就会打印, 用来判断机器上/镜像里跑的到底是哪一版
 # (真机上出过"脚本改了但跑的还是旧版"的扯皮, 有这一行就不用猜)
-INSTALL_VER="2026-09-19.5"
+INSTALL_VER="2026-09-19.6"
 INSTALL_MODE_ZH="分区复制安装: 只复制系统分区 + 重建分区表 + 目标盘独立 UUID"
 INSTALL_MODE_EN="partition-copy install: copies only the system partitions, rebuilds the target table and gives it fresh UUIDs"
 
@@ -1689,6 +1689,111 @@ main_menu() {
   done
 }
 
+# =============================================
+# UEFI 启动顺序
+# =============================================
+# 装到内置盘之后, 主板会给内置盘建一个启动项; 很多机器(Dell Wyse 等)从此一直
+# 从内置盘启动 —— 表现就是"优盘启动不了"(BIOS 里把 USB 调到第一也未必管用,
+# 因为 UEFI 是看 NVRAM 里的启动项顺序, 不是看设备顺序)。
+# 这个顺序在系统里改不了, 只能用 efibootmgr 改; 本功能就是把"当前启动的那块盘"
+# (也就是你正在用的优盘)排到第一位。
+uefi_boot_order() {
+  LIST_ONLY=""
+  [ "${1:-}" = "--list" ] && LIST_ONLY=1
+
+  if [ ! -d /sys/firmware/efi/efivars ]; then
+    log_err "$(zh_en '这不是 UEFI 启动(找不到 /sys/firmware/efi/efivars), 改不了启动顺序' \
+                      'Not booted via UEFI (no /sys/firmware/efi/efivars) - cannot change the boot order')"
+    return 1
+  fi
+  if ! command -v efibootmgr >/dev/null 2>&1; then
+    log_err "$(zh_en '固件里没有 efibootmgr' 'efibootmgr is not in this firmware')"
+    log_warn "$(zh_en '本仓库新构建的镜像已内置它; 旧系统可以: apk add efibootmgr(需要联网)' \
+                      'Newer images from this repo ship it; on an older system: apk add efibootmgr (needs internet)')"
+    return 1
+  fi
+
+  verbose=$(efibootmgr -v 2>/dev/null || true)
+  if [ -z "$verbose" ]; then
+    log_err "$(zh_en 'efibootmgr 读不到启动项(固件可能不支持)' 'efibootmgr could not read the boot entries (firmware may not support it)')"
+    return 1
+  fi
+
+  log_info "$(zh_en '当前 UEFI 启动项:' 'Current UEFI boot entries:')"
+  printf '%s\n' "$verbose" | sed 's/^/  /'
+
+  [ -n "$LIST_ONLY" ] && return 0
+
+  # 当前启动盘(优盘)的 /boot 分区 PARTUUID: 用来在启动项的设备路径里认出它
+  bootdisk=$(clone_src_disk 2>/dev/null || true)
+  [ -n "$bootdisk" ] || { log_err "$(zh_en '认不出当前启动盘' 'Cannot identify the running boot disk')"; return 1; }
+  esp_uuid=""
+  esp=$(mp_dev_name /boot 2>/dev/null || true)
+  if [ -z "$esp" ]; then
+    # 没有挂 /boot: 找该盘上带 vfat 的最靠前的分区
+    for row in $(part_table "/dev/$bootdisk" 2>/dev/null | awk '{ print $1 }'); do
+      sfx=$(part_suffix "$row")
+      st=$(part_table "/dev/$bootdisk" | awk -v s="$sfx" '{ n=$1; sub(/.*[^0-9]/,"",n); if (n==s) print $2 }')
+      [ -n "$st" ] || continue
+      case "$(fs_type_at "/dev/$bootdisk" $(( st * SECTOR )) 2>/dev/null || true)" in
+        vfat) esp=$(part_dev_name "$bootdisk" "$sfx"); break ;;
+      esac
+    done
+  fi
+  if [ -n "$esp" ]; then
+    sfx=$(part_suffix "$esp")
+    esp_uuid=$(part_table "/dev/$bootdisk" 2>/dev/null | awk -v s="$sfx" \
+      '{ n=$1; sub(/.*[^0-9]/,"",n); if (n==s) print $5 }' | tr 'A-Z' 'a-z')
+  fi
+  if [ -z "$esp_uuid" ]; then
+    log_warn "$(zh_en "认不出启动盘 /dev/$bootdisk 的 /boot(ESP) 分区 UUID, 只能列出启动项" \
+                      "Cannot identify the ESP UUID of /dev/$bootdisk - listing only")"
+    return 0
+  fi
+  log_info "$(zh_en "启动盘 /dev/$bootdisk 的 ESP PARTUUID: $esp_uuid" \
+                    "Boot disk /dev/$bootdisk ESP PARTUUID: $esp_uuid")"
+
+  entry=$(printf '%s\n' "$verbose" | awk -v u="$esp_uuid" '
+    { line = tolower($0); if (index(line, u) > 0 && $1 ~ /^Boot[0-9A-Fa-f]+\*?$/) {
+        n = $1; sub(/^Boot/, "", n); sub(/\*$/, "", n); print n; exit } }')
+
+  if [ -z "$entry" ]; then
+    log_warn "$(zh_en '启动项里还没有这块优盘(主板还没为它建条目), 现在创建一个' \
+                      'No boot entry for this USB yet - creating one')"
+    efibootmgr -c -d "/dev/$bootdisk" -p 1 -L "OpenWrt (USB)" -l '\\EFI\\BOOT\\BOOTX64.EFI' >/dev/null 2>&1 || {
+      log_err "$(zh_en 'efibootmgr -c 创建启动项失败' 'efibootmgr -c failed to create the entry')"; return 1; }
+    verbose=$(efibootmgr -v 2>/dev/null || true)
+    entry=$(printf '%s\n' "$verbose" | awk -v u="$esp_uuid" '
+      { line = tolower($0); if (index(line, u) > 0 && $1 ~ /^Boot[0-9A-Fa-f]+\*?$/) {
+          n = $1; sub(/^Boot/, "", n); sub(/\*$/, "", n); print n; exit } }')
+    [ -n "$entry" ] || { log_err "$(zh_en '创建后仍认不出该启动项' 'Still cannot find the entry after creating it')"; return 1; }
+  fi
+  log_info "$(zh_en "优盘的启动项编号: Boot$entry" "USB boot entry: Boot$entry")"
+
+  # 新顺序 = 该启动项 + 其余原有顺序(去掉它) + 没出现在顺序里的条目
+  oldorder=$(printf '%s\n' "$verbose" | sed -n 's/^BootOrder: *//p' | tr -d ' ' | tr ',' ' ')
+  neworder="$entry"
+  for o in $oldorder; do
+    [ "$o" = "$entry" ] && continue
+    neworder="$neworder,$o"
+  done
+  for e in $(printf '%s\n' "$verbose" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\?.*/\1/p'); do
+    case ",$neworder," in *",$e,"*) ;; *) neworder="$neworder,$e" ;; esac
+  done
+  neworder=$(printf '%s' "$neworder" | sed 's/,$//')
+
+  log_info "$(zh_en "把启动顺序改成: $neworder" "Setting boot order to: $neworder")"
+  if efibootmgr -o "$neworder" >/dev/null 2>&1; then
+    log_info "$(zh_en '已更新 UEFI 启动顺序(重启后优盘优先)' 'UEFI boot order updated (the USB will be tried first)')"
+  else
+    log_err "$(zh_en '写入启动顺序失败(有些固件不允许从系统改), 请开机按 F12/F2 手动选优盘' \
+                      'Failed to write the boot order (some firmwares refuse it) - use the F12/F2 boot menu instead')"
+    return 1
+  fi
+  efibootmgr 2>/dev/null | sed 's/^/  /'
+  return 0
+}
+
 # ---------- 安装流程 ----------
 do_install() {
   # 先把固件路径存进变量: find_target_disk 内部会用 set -- 拼 whiptail 参数,
@@ -1750,8 +1855,10 @@ do_install() {
       # 新 UUID: 两块盘各自的 grub.cfg 都指向自己, 不会互相干扰
       log_info "$(zh_en '目标盘已生成自己的 PARTUUID(与源盘不同), grub.cfg 里的 root= 也同步改过。' \
                         'The target got its own PARTUUIDs (different from the source) and grub.cfg was updated to match.')"
-      log_warn "$(zh_en '不过机器的 uEFI 可能仍优先从内置盘启动: 想从优盘启动就按 F12 选它; 最省事仍是装完拔掉优盘。' \
-                        'Note: the machine firmware may still prefer the internal disk: press F12 to pick the USB when you need it. Unplugging the USB is still the simplest option.')"
+      log_warn "$(zh_en '不过机器的 uEFI 可能仍优先从内置盘启动(这属于主板启动项, 系统里默认改不了):' \
+                        'Note: the firmware may still prefer the internal disk (that is a UEFI boot-order setting):')"
+      log_warn "$(zh_en '  想从优盘启动: 开机按 F12 选它; 或在系统里执行 openwrt-install --boot-order' \
+                        '  To boot the USB: press F12 and pick it; or run openwrt-install --boot-order')"
     fi
   fi
 
@@ -1785,6 +1892,10 @@ Usage: openwrt-install [options] [firmware.img.gz]
   --force          kept for compatibility: writing the disk is always forced now
                    (it no longer refuses just because partitions are mounted;
                     the boot disk itself is still refused)
+  --boot-order     put the running boot disk (the USB stick) first in the UEFI boot
+                   order - useful when the machine keeps booting the internal disk
+                   after it was installed to (needs efibootmgr + UEFI boot)
+  --boot-order-list  just print the current UEFI boot entries
   --same-uuid      keep the source's partition UUIDs on the target (byte-identical
                    clone; both disks then fight over root=PARTUUID, so unplug the
                    USB before rebooting). Default is to generate NEW UUIDs.
@@ -1827,6 +1938,10 @@ EOF
   --change-ip     直接进入"修改 LAN 口 IP"功能(对应 quickstart 的改 IP)
   --clone         兼容写法: 现在"装当前系统的分区到目标盘"就是默认行为, 加不加都一样
   --force         兼容开关: 现在默认就会直接写盘(不再因为"分区被占用"拒绝); 启动盘仍会拒绝
+  --boot-order    把当前启动的那块盘(优盘)排到 UEFI 启动顺序第一位 ——
+                  装到内置盘后主板可能就一直从内置盘启动(表现: "优盘启动不了"),
+                  这属于主板启动项, 系统里只能用 efibootmgr 改(需要 UEFI 启动 + 该工具)
+  --boot-order-list  只打印当前 UEFI 启动项
   --same-uuid     目标盘沿用源盘的分区 UUID(逐字节等价克隆)。两块盘同时插着时会因为
                   root=PARTUUID 相同而互相抢, 必须拔掉优盘再重启。
                   默认行为是给目标盘**生成全新的 UUID**(推荐, 详见 README)。
@@ -1881,6 +1996,8 @@ main() {
       --clone) MODE=install ;;   # 兼容旧写法: 现在默认就是克隆
       --force|-f) FORCE_WIPE=1 ;;   # 允许写"活动分区在挂载"的盘(仍先尝试卸载; 启动盘依旧拒绝)
       --same-uuid) SAME_UUID=1 ;;   # 目标盘沿用源盘的 UUID(逐字节等价克隆; 两块盘同时插着会打架)
+      --boot-order) MODE=bootorder ;;   # 把当前启动盘(U盘)排到 UEFI 启动顺序第一位
+      --boot-order-list) MODE=bootorderlist ;;  # 只打印当前 UEFI 启动项
       --en|--english) UI_FORCE=en ;;
       --zh|--chinese) UI_FORCE=zh ;;
       --disk)
@@ -1924,6 +2041,8 @@ main() {
 
   case "$MODE" in
     changeip) change_lan_ip; exit 0 ;;
+    bootorder)     uefi_boot_order;       exit $? ;;
+    bootorderlist) uefi_boot_order --list; exit $? ;;
     install)
       if [ -n "$FW_ARG" ]; then
         do_install "$FW_ARG"

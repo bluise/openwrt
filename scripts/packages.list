@@ -86,3 +86,7 @@ luci-lua-runtime
 e2fsprogs
 # mkfs.vfat: 建 FAT32 数据分区/U盘时用(自带固件里没有 mkfs.vfat)
 dosfstools
+
+# ---- UEFI 启动顺序(--boot-order): 让主板从优盘而不是内置盘启动 ----
+# 官方源里有 efibootmgr(依赖 efivar)。注意: 它只能在 UEFI 启动的系统里用。
+efibootmgr

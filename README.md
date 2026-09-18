@@ -466,3 +466,35 @@ config mount
 - 分区操作用 `sfdisk`，格式化用 `e2fsprogs`/`dosfstools`，挂载持久化用 `block-mount`
 - 新建分区只挑"未分配空间"，**不会动已有分区**；扩容也自动避开后面的分区
 - 依赖已进镜像：`e2fsprogs`、`dosfstools`（`mkfs.vfat`）、`sfdisk`、`resize2fs`、`block-mount`
+
+### 装完后主板还是从内置盘启动（"优盘启动不了"）
+
+这有两层原因，别混：
+
+1. **分区 UUID 相同**（已修）：老版本克隆时连分区表一起照抄，内核按
+   `root=PARTUUID=` 找根分区时两块盘都匹配，于是"用优盘启动却进了内置盘的系统"。
+   现在装到内置盘时会**给目标盘生成一套新 UUID**，并同步改掉 ESP 上的
+   `/boot/grub/grub.cfg`（`root=PARTUUID=...`）和 `fstab` 里的引用 —— 两块盘各自独立。
+2. **主板的 UEFI 启动项顺序**（系统里改不了，只能用 `efibootmgr`）：内置盘装好系统后，
+   主板会给它建一个启动项，Dell 这类机器之后就**一直从内置盘启动** —— 在 BIOS 里把
+   USB 调到"第一"往往也不管用，因为 UEFI 看的是 NVRAM 里的 `BootOrder`，不是设备顺序。
+
+对这一层，镜像里现在内置了 `efibootmgr`，可以一条命令把当前这块优盘排到第一位：
+
+```sh
+openwrt-install --boot-order-list   # 先看看现在有哪些启动项、顺序如何
+openwrt-install --boot-order        # 把当前启动的这块盘(优盘)排到第一位
+```
+
+（它靠"当前启动盘的 ESP PARTUUID"在启动项里认出优盘那一条；认不出就自动创建一条
+`OpenWrt (USB)`。有些固件不允许从系统改，那就按下面的办法手动来。）
+
+**不用这套工具的手动办法**（任何机器都成立）：
+
+- 开机按 **F12**（Dell 的一次性启动菜单）→ 选 `UEFI: <你的优盘>`
+- 或者 **F2** 进 BIOS → Boot Sequence → 选中内置盘那一项按 **Delete** 删掉它
+- 或者干脆把内置盘的引导记录清掉（反正要重装）：
+  ```sh
+  dd if=/dev/zero of=/dev/mmcblk1 bs=1M count=16 conv=fsync   # 清掉 GPT+ESP
+  sync; reboot            # 内置盘没有可引导的东西了, 固件只能走优盘
+  ```
