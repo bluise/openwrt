@@ -265,6 +265,40 @@ jobs:
             ls -l "$d"
           done
 
+      - name: Sanity-check the installer script (syntax + every function defined)
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # 存在的意义: 曾经在一次重构里用脚本替换代码块时, 把 clone_src_disk()
+          # 整个函数删掉了 —— 脚本语法仍然合法, 直到真机安装时才报
+          # "clone_src_disk: not found"。这里在构建阶段就把这类错误挡下来。
+          sh -n files/usr/bin/openwrt-install
+          missing=0
+          for f in \
+            clone_src_disk clone_resolve clone_prepare plan_clone clone_plan_report \
+            copy_plan copy_range write_target_table grow_target_rootfs target_part_dev \
+            check_target_size unmount_target countdown find_target_disk \
+            post_install_space_report find_rootfs_partition part_table disk_label_id \
+            part_suffix mp_dev_name fs_type_at fs_bytes_at disk_sectors disk_lba_max \
+            sectors_to_mib bytes_to_mib image_raw_size disk_of_part disk_desc is_boot_disk \
+            disk_mounts list_disks disk_transport first_word zh_en ui_setup ui_note \
+            change_lan_ip change_password set_nic_mode show_interfaces show_diag \
+            text_menu main_menu do_install valid_ipv4; do
+            if ! grep -qE "^[[:space:]]*$f\\(\\)[[:space:]]*\\{" files/usr/bin/openwrt-install; then
+              echo "::error::files/usr/bin/openwrt-install 缺少函数: $f"
+              missing=1
+            fi
+          done
+          [ "$missing" = "0" ] || exit 1
+          # 被删掉的旧函数不该再被调用
+          for gone in clone_src_bytes gpt_part_range; do
+            if grep -qE "(^|[^a-z_])$gone([^a-z_]|$)" files/usr/bin/openwrt-install; then
+              echo "::error::仍在引用已删除的函数: $gone"
+              exit 1
+            fi
+          done
+          echo "==> openwrt-install 自检通过: 语法 OK, 关键函数齐备"
+
       - name: Drop serial console from kernel cmdline (thin clients / Wyse 3040)
         if: steps.release.outputs.build == 'true'
         run: |

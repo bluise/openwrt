@@ -29,7 +29,7 @@ log_err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # 版本号: 每次改动都换 —— 日志第一行就会打印, 用来判断机器上/镜像里跑的到底是哪一版
 # (真机上出过"脚本改了但跑的还是旧版"的扯皮, 有这一行就不用猜)
-INSTALL_VER="2026-09-19.2"
+INSTALL_VER="2026-09-19.3"
 INSTALL_MODE_ZH="分区复制安装: 只复制系统分区 + 在目标盘重建分区表(不再整盘 dd)"
 INSTALL_MODE_EN="partition-copy install: copies only the system partitions and rebuilds the target partition table"
 
@@ -502,6 +502,14 @@ image_raw_size() {   # 未压缩镜像大小(字节), 非 gzip 则用文件本�
 # 不再整盘 dd, 而是"重建分区表 + 只复制系统分区":
 # 见下面 plan_clone / write_target_table 的说明 —— 128G 的 U 盘也能装进 7.2G 的盘。
 
+
+# 当前运行介质的整盘名(sda/mmcblk1/...): 由"分区 -> 整盘"的解析结果反推
+clone_src_disk() {
+  d=$(first_word $BOOT_DISKS)
+  [ -n "$d" ] || d=$(find_boot_disks 2>/dev/null | awk '{print $1}')
+  [ -n "$d" ] || return 1
+  echo "$d"
+}
 
 first_word() { set -- $1; echo "${1:-}"; }
 
