@@ -210,9 +210,58 @@ is_boot_disk() {
 # 这条也能挡住"把正在运行的系统盘当目标盘"。
 # (OpenWrt x86 上 /rom 与 /boot 都是真实分区, 所以运行盘一定在这里面。)
 # 走 boot_disks_of 是为了把 dm/md 叠加(LVM/RAID)解析回物理整盘。
-mounted_disks() {
-  awk '$1 ~ /^\/dev\// {print $1}' /proc/mounts 2>/dev/null \
-  | while read -r dev; do boot_disks_of "$dev"; done | sort -u | tr '\n' ' '
+# 挂载点算不算"关键": 只有承载运行系统本身的分区才算。
+# 数据分区一般挂在 /mnt/* 或 /media/*(老系统残留的分区会被启动系统自动挂载),
+# 那种情况**不该**阻止安装 —— 写盘前把它们卸掉就行(见 unmount_target)。
+mount_is_critical() {
+  case "$1" in
+    /mnt/*|/media/*) return 1 ;;
+    *) return 0 ;;      # / /rom /boot /overlay ... 以及任何不认识的挂载点都算关键
+  esac
+}
+
+# 有"关键分区"在挂载的整盘(会被保护, 不允许当目标盘)
+critical_mounted_disks() {
+  awk '$1 ~ /^\/dev\// {print $1, $2}' /proc/mounts 2>/dev/null \
+  | while read -r dev mp; do
+      if mount_is_critical "$mp"; then boot_disks_of "$dev"; fi
+    done | sort -u | tr '\n' ' '
+  :   # 保证函数返回 0(原因见 disk_mounts)
+}
+
+# 某块盘上正在挂载的分区(含挂载点), 形如 "/dev/sdb3@/mnt/sdb3 "; 供日志与卸载用
+disk_mounts() {   # $1=整盘名(如 sda)
+  awk '$1 ~ /^\/dev\// {print $1, $2}' /proc/mounts 2>/dev/null \
+  | while read -r dev mp; do
+      [ "$(disk_of_part "$dev")" = "$1" ] && printf '%s@%s ' "$dev" "$mp"
+    done
+  # 必须显式返回 0: 管道里最后一次 [ ] 测试失败会让函数返回 1, 而
+  # "x=$(disk_mounts ...)" 在 set -e 下会因此直接结束整个脚本(实测踩到过)
+  :
+}
+
+# 写盘前卸掉目标盘上已挂载的分区(整盘马上要被覆盖, 必须卸干净)
+unmount_target() {
+  t=$(basename "$TARGET")
+  parts=$(disk_mounts "$t" || true)
+  [ -n "$parts" ] || return 0
+  log_warn "$(zh_en "目标盘 $TARGET 上有分区正在挂载, 先卸载: $parts" \
+                    "Target disk $TARGET has mounted partitions, unmounting: $parts")"
+  awk '$1 ~ /^\/dev\// {print $1, $2}' /proc/mounts 2>/dev/null \
+  | while read -r dev mp; do
+      if [ "$(disk_of_part "$dev")" = "$t" ]; then
+        umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || \
+          log_err "$(zh_en "卸载 $mp 失败" "Failed to unmount $mp")"
+      fi
+    done
+  parts2=$(disk_mounts "$t" || true)
+  if [ -n "$parts2" ]; then
+    log_err "$(zh_en "目标盘仍有分区在挂载: $parts2 —— 拒绝写入(先手动 umount, 或用 --force)" \
+                      "Target still has mounted partitions: $parts2 - refusing to write (umount it, or use --force)")"
+    return 1
+  fi
+  log_info "$(zh_en '目标盘已卸载干净, 继续' 'Target disk is now unmounted, continuing')"
+  return 0
 }
 
 is_mounted_disk() {
@@ -255,7 +304,7 @@ find_target_disk() {
 
   TARGET=""
   BOOT_DISKS=$(find_boot_disks 2>/dev/null || true)
-  MOUNTED_DISKS=$(mounted_disks)
+  MOUNTED_DISKS=$(critical_mounted_disks || true)
   if [ -n "$BOOT_DISKS" ]; then
     for b in $BOOT_DISKS; do
       log_info "$(zh_en "启动盘: /dev/$b  ($(disk_desc "$b"))" "Boot disk: /dev/$b  ($(disk_desc "$b"))")"
@@ -272,9 +321,9 @@ find_target_disk() {
       log_err "$(zh_en "指定的目标盘不存在: $FORCE_DISK" "Target disk does not exist: $FORCE_DISK")"
       return 1
     fi
-    if is_boot_disk "$f" || is_mounted_disk "$f"; then
-      log_err "$(zh_en "$FORCE_DISK 正在被使用(启动盘, 或上面有已挂载的分区), 拒绝写入" \
-                        "$FORCE_DISK is in use (boot disk, or it has a mounted partition) - refusing")"
+    if is_boot_disk "$f" || { is_mounted_disk "$f" && [ "$FORCE_WIPE" != "1" ]; }; then
+      log_err "$(zh_en "$FORCE_DISK 正在被系统使用(启动盘, 或承载系统本身的分区在挂载), 拒绝写入" \
+                        "$FORCE_DISK is in use (boot disk, or a partition holding the running system) - refusing")"
       log_warn "$(zh_en '  要重刷这块盘: 从 U 盘启动后再执行, 或直接用 sysupgrade 升级。' \
                         '  To reflash it: boot from the USB stick first, or use sysupgrade.')"
       return 1
@@ -296,12 +345,16 @@ find_target_disk() {
       continue
     fi
     if is_mounted_disk "$d"; then
-      log_warn "$(zh_en "跳过正在使用的盘 /dev/$d (上面有已挂载的分区)" \
-                        "Skipping disk in use /dev/$d (it has a mounted partition)")"
-      log_warn "$(zh_en "  确实要写它: 先 umount 它上面的分区再重试" \
-                        "  If you really mean it: umount its partitions first, then retry")"
+      log_warn "$(zh_en "跳过正在使用的盘 /dev/$d (承载系统本身的分区在挂载: $(disk_mounts "$d"))" \
+                        "Skipping disk in use /dev/$d (a partition holding the running system: $(disk_mounts "$d"))")"
+      log_warn "$(zh_en '  确实要写它: 加 --force, 或先 umount 再重试' \
+                        '  If you really mean it: add --force, or umount it first')"
       continue
     fi
+    # 只是数据分区被自动挂载(老系统残留)不算在用: 写盘前会先卸掉
+    mm=$(disk_mounts "$d" || true)
+    [ -n "$mm" ] && log_info "$(zh_en "候选盘 /dev/$d 有已挂载的数据分区($mm), 写盘前会自动卸载" \
+                                       "Candidate /dev/$d has mounted data partitions ($mm); will unmount before writing")"
     if [ "$(disk_transport "$d")" = "usb" ]; then
       log_warn "$(zh_en "跳过USB设备 /dev/$d" "Skipping USB device /dev/$d")"
       continue
@@ -315,8 +368,8 @@ find_target_disk() {
 
   if [ "$N" -eq 0 ]; then
     log_err "$(zh_en '未找到可写入的硬盘!' 'No writable disk found!')"
-    log_warn "$(zh_en "已排除: 启动盘(${BOOT_DISKS:-未知})、正在挂载中的盘(${MOUNTED_DISKS:-无})、所有 USB 设备。" \
-                      "Excluded: boot disk (${BOOT_DISKS:-unknown}), mounted disks (${MOUNTED_DISKS:-none}), all USB devices.")"
+    log_warn "$(zh_en "已排除: 启动盘(${BOOT_DISKS:-未知})、承载运行系统的盘(${MOUNTED_DISKS:-无})、所有 USB 设备。" \
+                      "Excluded: boot disk (${BOOT_DISKS:-unknown}), disks holding the running system (${MOUNTED_DISKS:-none}), all USB devices.")"
     log_warn "$(zh_en '要写到外置盘/U盘请显式指定: openwrt-install --disk /dev/sdX' \
                       'To write to an external/USB disk, name it: openwrt-install --disk /dev/sdX')"
     log_warn "$(zh_en '若这台机器只有一块盘且正在运行它: 请从 U 盘启动后再装, 或用 sysupgrade 升级。' \
@@ -971,7 +1024,11 @@ show_diag() {
   echo "-- $(zh_en '启动盘解析' 'boot disk resolution') --"
   echo "  src  = $(find_boot_src 2>/dev/null || zh_en '(未识别)' '(unidentified)')"
   echo "  disk = ${BOOT_DISKS:-$(find_boot_disks 2>/dev/null || zh_en '(未识别)' '(unidentified)')}"
-  echo "  $(zh_en '有分区在挂载的盘(会被保护)' 'disks with mounted partitions (protected)'): ${MOUNTED_DISKS:-$(mounted_disks)}"
+  echo "  $(zh_en '承载运行系统的盘(会被保护)' 'disks holding the running system (protected)'): ${MOUNTED_DISKS:-$(critical_mounted_disks)}"
+  for d in $(list_disks); do
+    mm=$(disk_mounts "$d" || true)
+    [ -n "$mm" ] && echo "  $(zh_en '挂载情况' 'mounts') /dev/$d: $mm"
+  done
   echo
   echo "-- $(zh_en '候选判定' 'candidate decision') --"
   for d in $(list_disks); do
@@ -1175,6 +1232,7 @@ do_install() {
     clone_prepare || return 1
   fi
   check_target_size || return 1
+  unmount_target || return 1
   countdown
 
   if [ "$CLONE" = "1" ]; then
@@ -1228,6 +1286,8 @@ Usage: openwrt-install [options] [firmware.img.gz]
   --change-ip      only change the LAN IP
   --clone          kept for compatibility: cloning the running medium is now
                    the default install method, with or without this flag
+  --force          allow writing to a target that still has mounted partitions
+                   (it unmounts them first; the boot disk is always refused)
   --diag           print diagnostics (disks, boot disk, candidates, clone
                    source, tools) - run this when an install fails
   --disk <dev>     target disk, e.g. --disk /dev/sdb
@@ -1266,6 +1326,7 @@ EOF
   --no-menu       跳过菜单, 直接安装到内置硬盘(原一键安装行为)
   --change-ip     直接进入"修改 LAN 口 IP"功能(对应 quickstart 的改 IP)
   --clone         兼容写法: 现在"克隆安装"就是默认行为, 加不加都一样
+  --force         允许写入"仍有分区在挂载"的目标盘(会先尝试卸载; 启动盘永远拒绝)
   --diag          打印诊断信息(磁盘/启动盘/候选判定/克隆源/工具), 装不上时先跑这个
   --disk <设备>   指定目标盘, 例如 --disk /dev/sdb
                   (多块盘且非交互环境下**必须**用它; 也接受
@@ -1301,6 +1362,7 @@ main() {
   FW_ARG=""
   FORCE_DISK=${OPENWRT_TARGET_DISK:-}
   FORCE_CLONE=""
+  FORCE_WIPE=""
 
   # 先按环境定一次语言(让解析阶段的报错也是对的), 解析完再按 --en/--zh 重定一次
   ui_setup
@@ -1313,6 +1375,7 @@ main() {
       --change-ip) MODE=changeip ;;
       --diag|--check) MODE=diag ;;
       --clone) MODE=install ;;   # 兼容旧写法: 现在默认就是克隆
+      --force|-f) FORCE_WIPE=1 ;;   # 允许写"活动分区在挂载"的盘(仍先尝试卸载; 启动盘依旧拒绝)
       --en|--english) UI_FORCE=en ;;
       --zh|--chinese) UI_FORCE=zh ;;
       --disk)
