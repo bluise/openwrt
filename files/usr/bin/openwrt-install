@@ -220,29 +220,33 @@ find_target_disk() {
   BOOT_DISKS=$(find_boot_disks 2>/dev/null || true)
   if [ -n "$BOOT_DISKS" ]; then
     for b in $BOOT_DISKS; do
-      log_info "启动盘: /dev/$b  ($(disk_desc "$b"))"
+      log_info "$(zh_en "启动盘: /dev/$b  ($(disk_desc "$b"))" "Boot disk: /dev/$b  ($(disk_desc "$b"))")"
     done
   else
-    log_warn "无法识别启动盘(不影响安装, 但请确认目标盘没写错)"
+    log_warn "$(zh_en '无法识别启动盘(不影响安装, 但请确认目标盘没写错)' \
+                      'Could not identify the boot disk (installation still works, but double-check the target)')"
   fi
 
   # (1) 显式指定
   if [ -n "$FORCE_DISK" ]; then
     f=$(basename "$FORCE_DISK")
     if [ ! -b "/dev/$f" ]; then
-      log_err "指定的目标盘不存在: $FORCE_DISK"
+      log_err "$(zh_en "指定的目标盘不存在: $FORCE_DISK" "Target disk does not exist: $FORCE_DISK")"
       return 1
     fi
     if is_boot_disk "$f"; then
-      log_err "$FORCE_DISK 是当前启动盘, 拒绝写入(会清空正在运行的系统)"
-      log_warn "  要重刷这块盘: 从 U 盘启动后再执行, 或直接用 sysupgrade 升级。"
+      log_err "$(zh_en "$FORCE_DISK 是当前启动盘, 拒绝写入(会清空正在运行的系统)" \
+                        "$FORCE_DISK is the running boot disk - refusing to wipe the live system")"
+      log_warn "$(zh_en '  要重刷这块盘: 从 U 盘启动后再执行, 或直接用 sysupgrade 升级。' \
+                        '  To reflash it: boot from the USB stick first, or use sysupgrade.')"
       return 1
     fi
     if [ "$(disk_transport "$f")" = "usb" ]; then
-      log_warn "$FORCE_DISK 是 USB 设备 —— 你显式指定了, 按你的意思继续"
+      log_warn "$(zh_en "$FORCE_DISK 是 USB 设备 —— 你显式指定了, 按你的意思继续" \
+                        "$FORCE_DISK is a USB device - you asked for it explicitly, continuing")"
     fi
     TARGET="/dev/$f"
-    log_info "目标盘(显式指定): $TARGET  ($(disk_desc "$f"))"
+    log_info "$(zh_en "目标盘(显式指定): $TARGET  ($(disk_desc "$f"))" "Target disk (explicit): $TARGET  ($(disk_desc "$f"))")"
     return 0
   fi
 
@@ -250,14 +254,14 @@ find_target_disk() {
   CAND=""
   for d in $(list_disks); do
     if is_boot_disk "$d"; then
-      log_warn "跳过启动盘 /dev/$d"
+      log_warn "$(zh_en "跳过启动盘 /dev/$d" "Skipping boot disk /dev/$d")"
       continue
     fi
     if [ "$(disk_transport "$d")" = "usb" ]; then
-      log_warn "跳过USB设备 /dev/$d"
+      log_warn "$(zh_en "跳过USB设备 /dev/$d" "Skipping USB device /dev/$d")"
       continue
     fi
-    log_info "候选盘: /dev/$d  ($(disk_desc "$d"))"
+    log_info "$(zh_en "候选盘: /dev/$d  ($(disk_desc "$d"))" "Candidate disk: /dev/$d  ($(disk_desc "$d"))")"
     CAND="$CAND $d"
   done
 
@@ -265,21 +269,25 @@ find_target_disk() {
   for d in $CAND; do N=$((N + 1)); done
 
   if [ "$N" -eq 0 ]; then
-    log_err "未找到可写入的硬盘!"
-    log_warn "已排除启动盘(${BOOT_DISKS:-未知})与所有 USB 设备。"
-    log_warn "要写到外置盘/U盘请显式指定: openwrt-install --disk /dev/sdX"
-    log_warn "若这台机器只有一块盘且正是启动盘: 请从 U 盘启动后再装, 或用 sysupgrade 升级。"
+    log_err "$(zh_en '未找到可写入的硬盘!' 'No writable disk found!')"
+    log_warn "$(zh_en "已排除启动盘(${BOOT_DISKS:-未知})与所有 USB 设备。" \
+                      "Excluded: boot disk (${BOOT_DISKS:-unknown}) and all USB devices.")"
+    log_warn "$(zh_en '要写到外置盘/U盘请显式指定: openwrt-install --disk /dev/sdX' \
+                      'To write to an external/USB disk, name it: openwrt-install --disk /dev/sdX')"
+    log_warn "$(zh_en '若这台机器只有一块盘且正是启动盘: 请从 U 盘启动后再装, 或用 sysupgrade 升级。' \
+                      'If this machine has only one disk and it is the boot disk: boot from the USB stick, or use sysupgrade.')"
     return 1
   fi
 
   if [ "$N" -eq 1 ]; then
     TARGET="/dev/$(first_cand)"
-    log_info "目标盘(唯一候选): $TARGET  ($(disk_desc "$(basename "$TARGET")"))"
+    log_info "$(zh_en "目标盘(唯一候选): $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
+                      "Target disk (only candidate): $TARGET  ($(disk_desc "$(basename "$TARGET")"))")"
     return 0
   fi
 
   # (3) 多块候选: 只探测时取第一块, 否则必须由人确认
-  log_warn "检测到 $N 块可写入的磁盘:"
+  log_warn "$(zh_en "检测到 $N 块可写入的磁盘:" "Found $N writable disks:")"
   i=0
   for d in $CAND; do
     i=$((i + 1))
@@ -290,28 +298,29 @@ find_target_disk() {
     # 注意: 不能用 `for d in $CAND; do TARGET=...; done` —— 那样留下的是
     # 最后一块, 与这里的"只探测第一块"语义相反。
     TARGET="/dev/$(first_cand)"
-    log_info "(仅探测)使用第一块候选盘: $TARGET"
+    log_info "$(zh_en "(仅探测)使用第一块候选盘: $TARGET" "(probe only) using first candidate: $TARGET")"
     return 0
   fi
 
   if [ ! -t 0 ]; then
-    log_err "当前不是交互终端, 无法询问, 拒绝替你猜哪块盘。"
-    log_warn "请用 --disk /dev/sdX 指定目标盘后重试。"
+    log_err "$(zh_en '当前不是交互终端, 无法询问, 拒绝替你猜哪块盘。' \
+                      'Not an interactive terminal - refusing to guess which disk to wipe.')"
+    log_warn "$(zh_en '请用 --disk /dev/sdX 指定目标盘后重试。' 'Re-run with --disk /dev/sdX to name the target disk.')"
     return 1
   fi
 
-  printf '请输入编号并回车: '
+  printf '%s' "$(zh_en '请输入编号并回车: ' 'Enter a number and press Enter: ')"
   read -r SEL
   i=0
   for d in $CAND; do
     i=$((i + 1))
     if [ "$SEL" = "$i" ]; then
       TARGET="/dev/$d"
-      log_info "已选择: $TARGET  ($(disk_desc "$d"))"
+      log_info "$(zh_en "已选择: $TARGET  ($(disk_desc "$d"))" "Selected: $TARGET  ($(disk_desc "$d"))")"
       return 0
     fi
   done
-  log_err "无效的编号: $SEL"
+  log_err "$(zh_en "无效的编号: $SEL" "Invalid selection: $SEL")"
   return 1
 }
 
@@ -344,8 +353,14 @@ find_firmware() {
     done
   fi
   if [ -z "$FW" ]; then
-    log_err "未找到固件镜像 *combined-efi*.img.gz! 请把固件放到U盘并挂载后重试, 或手动指定路径"
-    exit 1
+    log_err "$(zh_en '未找到固件镜像 *combined-efi*.img.gz!' 'Firmware image *combined-efi*.img.gz not found!')"
+    log_warn "$(zh_en '已查找: /mnt /media /boot /mnt/usb 以及所有 USB 分区(自动挂载尝试过)' \
+                      'Searched: /mnt /media /boot /mnt/usb and every USB partition (auto-mount attempted)')"
+    log_warn "$(zh_en '请把 openwrt-*-combined-efi.img.gz 放到 U 盘/任意可读位置, 或直接指定路径:' \
+                      'Put openwrt-*-combined-efi.img.gz on a USB stick (or any readable path), or pass the path:')"
+    log_warn "  openwrt-install --no-menu /path/to/openwrt-*-combined-efi.img.gz"
+    # 注意用 return 而不是 exit: 菜单模式下应退回菜单, 而不是把整个程序结束掉
+    return 1
   fi
 }
 
@@ -455,25 +470,27 @@ find_rootfs_partition() {
 
 post_install_space_report() {
   dev="$1"
-  log_info "检查磁盘空间占用情况..."
+  log_info "$(zh_en '检查磁盘空间占用情况...' 'Checking disk space...')"
 
   if [ ! -r "$dev" ]; then
-    log_warn "无法读取 $dev, 跳过空间检查"
+    log_warn "$(zh_en "无法读取 $dev, 跳过空间检查" "Cannot read $dev, skipping space check")"
     return 0
   fi
 
   find_rootfs_partition "$dev"
   if [ -z "$BEST_IDX" ]; then
-    log_warn "未能识别系统分区, 跳过空间检查"
+    log_warn "$(zh_en '未能识别系统分区, 跳过空间检查' 'System partition not recognized, skipping space check')"
     return 0
   fi
 
   fsmax=$(disk_lba_max "$dev")
-  log_info "磁盘标识     : $(basename "$dev")  (${fsmax:-未知} 可用末扇区)"
-  log_info "系统分区     : ${dev}${BEST_IDX}  ($(sectors_to_mib "$BEST_SIZE") MiB, ${BEST_FS})"
+  log_info "$(zh_en "磁盘标识     : $(basename "$dev")  (${fsmax:-未知} 可用末扇区)" \
+                    "Disk         : $(basename "$dev")  (${fsmax:-unknown} last usable sector)")"
+  log_info "$(zh_en "系统分区     : ${dev}${BEST_IDX}  ($(sectors_to_mib "$BEST_SIZE") MiB, ${BEST_FS})" \
+                    "System part  : ${dev}${BEST_IDX}  ($(sectors_to_mib "$BEST_SIZE") MiB, ${BEST_FS})")"
 
   if [ -z "$fsmax" ]; then
-    log_warn "读不到磁盘总容量, 无法判断空间"
+    log_warn "$(zh_en '读不到磁盘总容量, 无法判断空间' 'Cannot read total disk size, skipping space check')"
     return 0
   fi
 
@@ -482,26 +499,54 @@ post_install_space_report() {
   target_secs=$(( ROOT_PART_TARGET_MIB * 2048 ))
 
   if [ "$BEST_FS" = "squashfs" ]; then
-    cat <<EOF
+    if [ "$UI_EN" = "1" ]; then
+      cat <<EOF
+
+  NOTE: you flashed the squashfs variant - the root filesystem is read-only,
+  so resizing means making the extra space an overlay, not running resize2fs.
+  If you want a simply writable root, use the ext4 variant instead:
+    openwrt-x86-64-generic-ext4-combined-efi.img.gz
+EOF
+    else
+      cat <<EOF
 
   ⚠ 你刷入的是 squashfs 版: 根文件系统为只读, 扩容语义与 ext4 不同 ——
     扩分区后需要把新空间做成 overlay, 而不是对分区跑 resize2fs。
     如需简单可写空间, 建议改用 ext4 版镜像:
       openwrt-x86-64-generic-ext4-combined-efi.img.gz
 EOF
+    fi
     return 0
   fi
 
   missing=""
   command -v sfdisk    >/dev/null 2>&1 || missing="$missing sfdisk"
   command -v resize2fs >/dev/null 2>&1 || missing="$missing resize2fs"
-  [ -n "$missing" ] && log_warn "缺少工具:$missing"
+  [ -n "$missing" ] && log_warn "$(zh_en "缺少工具:$missing" "Missing tools:$missing")"
 
   if [ "$BEST_SIZE" -lt "$target_secs" ] 2>/dev/null; then
     need=$(( target_secs - BEST_SIZE ))
-    log_warn "rootfs 分区小于目标值: 可扩约 $(sectors_to_mib "$need") MiB"
-    log_info "            分区 $(sectors_to_mib "$BEST_SIZE") MiB -> $(sectors_to_mib "$target_secs") MiB"
-    cat <<EOF
+    log_warn "$(zh_en "rootfs 分区小于目标值: 可扩约 $(sectors_to_mib "$need") MiB" \
+                      "rootfs partition is below target: $(sectors_to_mib "$need") MiB can be added")"
+    log_info "$(zh_en "            分区 $(sectors_to_mib "$BEST_SIZE") MiB -> $(sectors_to_mib "$target_secs") MiB" \
+                      "            partition $(sectors_to_mib "$BEST_SIZE") MiB -> $(sectors_to_mib "$target_secs") MiB")"
+    if [ "$UI_EN" = "1" ]; then
+      cat <<EOF
+
+  -- Resize steps (start ${BEST_START} MUST stay the same, or the filesystem breaks) --
+        echo 'start=${BEST_START}, size=${target_secs}' | sfdisk -N ${BEST_IDX} --force ${dev}
+        e2fsck -fy ${dev}${BEST_IDX}
+        resize2fs ${dev}${BEST_IDX}
+    If the kernel does not pick up the new size, reboot then run e2fsck/resize2fs.
+    sfdisk -N fixes the GPT by itself (moves the backup table, updates the
+    protective MBR, raises the last usable LBA). If it says the device is busy,
+    add --no-reread and then run: partx -u ${dev}
+    You can also do this on another Linux host with ${dev} replaced by the real
+    device name (e.g. /dev/sdX).
+  ---------------------------------------------------------------------------
+EOF
+    else
+      cat <<EOF
 
   ── 扩容步骤 (起点 ${BEST_START} 必须保持不变, 否则会损坏文件系统) ──
         echo 'start=${BEST_START}, size=${target_secs}' | sfdisk -N ${BEST_IDX} --force ${dev}
@@ -514,13 +559,17 @@ EOF
     把 ${dev} 换成实际盘符(如 /dev/sdX)后执行同样命令。
   ────────────────────────────────────────────────────
 EOF
+    fi
   else
-    log_info "rootfs 分区 $(sectors_to_mib "$BEST_SIZE") MiB (已达目标 ${ROOT_PART_TARGET_MIB} MiB) ✅"
-    log_info "剩余空间保持未分配, 未创建数据分区(本固件的约定)"
+    log_info "$(zh_en "rootfs 分区 $(sectors_to_mib "$BEST_SIZE") MiB (已达目标 ${ROOT_PART_TARGET_MIB} MiB) ✅" \
+                      "rootfs partition $(sectors_to_mib "$BEST_SIZE") MiB (target ${ROOT_PART_TARGET_MIB} MiB reached) OK")"
+    log_info "$(zh_en '剩余空间保持未分配, 未创建数据分区(本固件的约定)' \
+                      'Remaining space is left unallocated; no data partition is created (by design)')"
   fi
 
   if [ -n "$missing" ]; then
-    log_warn "固件内缺少$missing: 上面依赖它们的步骤需先安装, 或改在 Linux 主机上执行"
+    log_warn "$(zh_en "固件内缺少$missing: 上面依赖它们的步骤需先安装, 或改在 Linux 主机上执行" \
+                      "Missing in firmware:$missing - install them first, or do those steps on a Linux host")"
   fi
   return 0
 }
@@ -692,7 +741,9 @@ set_nic_mode() {
 
   if [ "$CHOICE" = "single" ]; then
     if [ "$N" -gt 1 ]; then
-      confirm "提示" "检测到 $N 个网口。\n\n单网卡模式会把【全部】网口都作为 LAN (同一网桥),\n不使用 WAN 口 —— 除非上游是光猫桥接+拨号, 否则将无法上网。\n\n确定继续?" || return 0
+      confirm "$(zh_en '提示' 'Notice')" \
+        "$(zh_en "检测到 $N 个网口。\n\n单网卡模式会把【全部】网口都作为 LAN (同一网桥),\n不使用 WAN 口 —— 除非上游是光猫桥接+拨号, 否则将无法上网。\n\n确定继续?" \
+                   "Found $N NICs.\n\nSingle-NIC mode puts ALL of them into one LAN bridge and uses\nno WAN port - you will have no internet unless upstream does PPPoE.\n\nContinue?")" || return 0
     fi
     uci -q delete network.wan 2>/dev/null || true
     uci -q delete network.wan6 2>/dev/null || true
@@ -744,6 +795,55 @@ show_interfaces() {
     "$(zh_en "LAN 管理地址: ${LAN:-未知}" "LAN address: ${LAN:-unknown}")$(zh_en '\n(设备名 eth0/eth1 等, 取决于网卡)' '\n(names like eth0/eth1 depend on the NIC)')\n\n$TXT"
 }
 
+# 诊断: 装不上时先跑这个, 一眼看清是哪一步不满足条件
+show_diag() {
+  echo "===== $(zh_en '诊断信息' 'Diagnostics') ====="
+  echo "TERM=${TERM:-} LANG=${LANG:-} LC_ALL=${LC_ALL:-} UI_EN=${UI_EN:-0} uid=$(id -u 2>/dev/null)"
+  echo
+  echo "-- $(zh_en '整盘' 'disks') --"
+  for d in $(list_disks); do echo "  /dev/$d  ($(disk_desc "$d"))"; done
+  echo
+  echo "-- $(zh_en '启动盘解析' 'boot disk resolution') --"
+  echo "  src  = $(find_boot_src 2>/dev/null || zh_en '(未识别)' '(unidentified)')"
+  echo "  disk = ${BOOT_DISKS:-$(find_boot_disks 2>/dev/null || zh_en '(未识别)' '(unidentified)')}"
+  echo
+  echo "-- $(zh_en '候选判定' 'candidate decision') --"
+  for d in $(list_disks); do
+    if is_boot_disk "$d"; then
+      echo "  /dev/$d: $(zh_en '启动盘 -> 排除' 'boot disk -> excluded')"
+    elif [ "$(disk_transport "$d")" = "usb" ]; then
+      echo "  /dev/$d: $(zh_en 'USB -> 排除' 'USB -> excluded')"
+    else
+      echo "  /dev/$d: $(zh_en '可写入 -> 候选' 'writable -> candidate')"
+    fi
+  done
+  echo
+  echo "-- $(zh_en '分区' 'partitions') --"
+  for p in /sys/class/block/*; do
+    [ -e "$p/partition" ] || continue
+    n=$(basename "$p")
+    echo "  /dev/$n  $(zh_en '所属盘' 'on')=$(disk_of_part "$n")  $(disk_transport "$(disk_of_part "$n")")"
+  done
+  echo
+  echo "-- $(zh_en '挂载点' 'mounts (/, /rom, /overlay, usb)') --"
+  awk '$2=="/"||$2=="/rom"||$2=="/overlay"||$3=="vfat"||$3=="exfat"||$3=="ntfs"{print "  "$2"  "$1"  "$3}' /proc/mounts 2>/dev/null | head -10
+  echo
+  echo "-- $(zh_en '固件镜像搜索' 'firmware image search') --"
+  for mnt in /mnt /media /boot /mnt/usb; do
+    [ -d "$mnt" ] || continue
+    hit=$(find "$mnt" -maxdepth 3 -name '*combined-efi*.img.gz' 2>/dev/null | head -3 | tr '\n' ' ')
+    echo "  $mnt: ${hit:-$(zh_en '无' 'none')}"
+  done
+  echo
+  echo "-- $(zh_en '工具' 'tools') --"
+  for t in whiptail sfdisk resize2fs e2fsck gunzip dd mount umount partx mkfs.ext4; do
+    printf '  %-11s %s\n' "$t" "$(command -v $t 2>/dev/null || echo MISSING)"
+  done
+  echo
+  echo "-- $(zh_en '空闲空间' 'free space') --"
+  df -h / /tmp 2>/dev/null | sed 's/^/  /'
+}
+
 # 纯文本菜单兜底: 没有 whiptail 或没有终端时使用。
 # 仍然是"选择"而不是记命令 —— 输入编号回车即可。
 # 退出方式: 0 / q / quit / exit / 空回车 / Ctrl-D(EOF)。
@@ -759,6 +859,7 @@ text_menu() {
   5) $(zh_en '查看网络接口' 'Show network interfaces')
   6) $(zh_en '显示扩容命令(如需要)' 'Show resize commands (if needed)')
   7) $(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')
+  8) $(zh_en '诊断(装不上时先看这个)' 'Diagnose (run this when install fails)')
   0) $(zh_en '退出 (输入 q 也可以)' 'Quit (or type q)')
 ========================================
 EOF
@@ -793,6 +894,11 @@ EOF
       4) passwd root ;;
       5) show_interfaces ;;
       7) set_nic_mode || true ;;
+      8)
+        show_diag
+        printf '%s' "$(zh_en '按回车继续...' 'Press Enter to continue...')"
+        read -r _x || true
+        ;;
       0|q|Q|quit|QUIT|exit|EXIT|"") echo "$(zh_en '已退出' 'Bye')"; return 0 ;;
       *) echo "$(zh_en "无效编号: $N" "Invalid input: $N")" ;;
     esac
@@ -805,7 +911,7 @@ main_menu() {
     # --cancel-button: Esc 或"取消"按钮都直接退出(菜单项被截断时也能退出来)
     CHOICE=$(whiptail --title "$(zh_en 'OpenWrt 安装助手' 'OpenWrt Installer')" \
       --cancel-button "$(zh_en '退出' 'Quit')" --menu \
-      "$(zh_en '请选择要执行的操作 (Esc=退出):' 'Select an action (Esc = quit):')" 21 76 8 \
+      "$(zh_en '请选择要执行的操作 (Esc=退出):' 'Select an action (Esc = quit):')" 22 76 9 \
       "1" "$(zh_en '安装系统到内置硬盘 (会清空目标盘!)' 'Install to internal disk (ERASES the target disk!)')" \
       "2" "$(zh_en '查看磁盘与空间状态' 'Show disks and space status')" \
       "3" "$(zh_en '修改 LAN 口 IP 地址' 'Change LAN IP address')" \
@@ -813,6 +919,7 @@ main_menu() {
       "5" "$(zh_en '查看网络接口' 'Show network interfaces')" \
       "6" "$(zh_en '显示扩容命令(如需要)' 'Show resize commands (if needed)')" \
       "7" "$(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')" \
+      "8" "$(zh_en '诊断(装不上时先看这个)' 'Diagnose (run this when install fails)')" \
       "0" "$(zh_en '退出' 'Quit')" \
       3>&1 1>&2 2>&3) || return 0
     case "$CHOICE" in
@@ -820,7 +927,31 @@ main_menu() {
         if confirm "$(zh_en '确认安装' 'Confirm install')" \
            "$(zh_en '即将把固件写入内置硬盘, 目标盘上的所有数据都会被清空。\n\n是否继续?' \
                       'The firmware will be written to the internal disk.\nALL DATA on the target disk will be erased.\n\nContinue?')"; then
-          do_install || true
+          # 关键: 安装过程既实时显示、又存一份日志, 结束后用对话框把整段日志呈现
+          # 出来 —— 否则一旦出错, 那些行会被菜单重绘立刻刷掉, 用户根本看不清报的
+          # 什么错(这就是"装不上但不知道原因"的来源)。
+          #
+          # 为什么要包一层 ( set -e; ... ):
+          #   任何 if/||/&& 包装都会让 errexit 在函数内部失效(dash 与 busybox ash
+          #   都是这个语义, 已实测确认), 那样 dd 写盘失败就不会中断安装, 脚本还会
+          #   继续打印"安装完成"。所以这里显式在子 shell 里恢复 errexit 得到真实
+          #   失败, 再在关闭 errexit 的外层把退出码写进文件, tee 同时输出到屏幕
+          #   与日志文件。
+          TMPF=$(mktemp 2>/dev/null || echo /tmp/.oinst.$$)
+          RCF=$(mktemp 2>/dev/null || echo /tmp/.orc.$$)
+          set +e
+          { ( set -e; do_install ); echo $? > "$RCF"; } 2>&1 | tee "$TMPF"
+          set -e
+          RC=$(cat "$RCF" 2>/dev/null || echo 1)
+          TXT=$(sed 's/\x1b\[[0-9;]*m//g' "$TMPF" 2>/dev/null)
+          rm -f "$TMPF" "$RCF"
+          if [ "$RC" = "0" ]; then
+            msg "$(zh_en '安装完成' 'Install finished')" "${TXT:-$(zh_en '无输出' 'no output')}"
+          else
+            msg "$(zh_en '安装失败' 'Install FAILED')" \
+              "$(zh_en "返回码 $RC —— 下面是完整过程(可上下翻页)\n\n" \
+                         "exit code $RC - full log below (arrow keys scroll)\n\n")${TXT:-$(zh_en '无输出' 'no output')}"
+          fi
         fi
         ;;
       2|6)
@@ -843,6 +974,13 @@ main_menu() {
       4) change_password ;;
       5) show_interfaces ;;
       7) set_nic_mode || true ;;
+      8)
+        TMPF=$(mktemp 2>/dev/null || echo /tmp/.odiag.$$)
+        show_diag >"$TMPF" 2>&1 || true
+        TXT=$(sed 's/\x1b\[[0-9;]*m//g' "$TMPF" 2>/dev/null)
+        rm -f "$TMPF"
+        msg "$(zh_en '诊断信息' 'Diagnostics')" "${TXT:-$(zh_en '未获取到信息' 'no information')}"
+        ;;
       0|q|Q|quit|"") return 0 ;;
     esac
   done
@@ -885,12 +1023,49 @@ do_install() {
 
 # ---------- 入口 ----------
 usage() {
+  if [ "$UI_EN" = "1" ]; then
+    cat <<EOF
+Usage: openwrt-install [options] [firmware.img.gz]
+
+  (no args)        interactive menu (recommended)
+  --no-menu        skip the menu, install straight to the internal disk
+  --change-ip      only change the LAN IP
+  --diag           print diagnostics (disks, boot disk, candidates, firmware
+                   search, tools) - run this when an install fails
+  --disk <dev>     target disk, e.g. --disk /dev/sdb
+                   (required when several disks exist and there is no terminal;
+                    OPENWRT_TARGET_DISK=/dev/sdb works too)
+  --en / --zh      English (pure ASCII) / Chinese menu; same as OPENWRT_UI=en|zh
+                   Use --en when the terminal cannot show Chinese (local console
+                   without CJK glyphs, or a GBK SSH client). TERM=linux/dumb/empty
+                   selects English automatically.
+  -h, --help       this help
+
+Menu: quit with 0, Esc, or the "Quit" button; the text menu also accepts q.
+
+Target disk rules:
+  exclude the boot disk and all USB devices -> a single candidate is used as-is
+  several candidates -> you pick (no terminal => error out, never guesses)
+  --disk <dev>       -> used as-is (the boot disk is still refused)
+
+Examples:
+  openwrt-install
+  openwrt-install --en
+  openwrt-install --diag
+  openwrt-install --no-menu
+  openwrt-install --no-menu /mnt/sda1/openwrt-*.img.gz
+  openwrt-install --no-menu --disk /dev/sdb
+  openwrt-install --change-ip
+EOF
+    return 0
+  fi
   cat <<EOF
 用法: openwrt-install [选项] [固件路径]
 
   (无参数)        显示交互式菜单 (推荐)
   --no-menu       跳过菜单, 直接安装到内置硬盘(原一键安装行为)
   --change-ip     直接进入"修改 LAN 口 IP"功能(对应 quickstart 的改 IP)
+  --diag          打印诊断信息(磁盘/启动盘/候选判定/固件搜索/工具), 装不上时先跑这个
   --disk <设备>   指定目标盘, 例如 --disk /dev/sdb
                   (多块盘且非交互环境下**必须**用它; 也接受
                    OPENWRT_TARGET_DISK=/dev/sdb 环境变量)
@@ -909,6 +1084,7 @@ usage() {
 示例:
   openwrt-install                                  # 菜单模式
   openwrt-install --en                             # 英文菜单(终端不支持中文时)
+  openwrt-install --diag                           # 诊断, 看为什么装不上
   openwrt-install --no-menu                        # 一键安装(自动找固件/目标盘)
   openwrt-install --no-menu /mnt/sda1/xxx.img.gz   # 指定固件
   openwrt-install --no-menu --disk /dev/sdb        # 指定目标盘
@@ -921,23 +1097,28 @@ main() {
   FW_ARG=""
   FORCE_DISK=${OPENWRT_TARGET_DISK:-}
 
-  # 先解析选项(不做 root 检查, 保证 --help 谁都能看)
+  # 先按环境定一次语言(让解析阶段的报错也是对的), 解析完再按 --en/--zh 重定一次
+  ui_setup
+
+  # 解析选项(不做 root 检查, 保证 --help 谁都能看)
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) usage; exit 0 ;;
       --no-menu) MODE=install ;;
       --change-ip) MODE=changeip ;;
+      --diag|--check) MODE=diag ;;
       --en|--english) UI_FORCE=en ;;
       --zh|--chinese) UI_FORCE=zh ;;
       --disk)
         shift
         if [ -z "${1:-}" ]; then
-          log_err "--disk 需要一个设备路径, 例如 --disk /dev/sdb"
+          log_err "$(zh_en '--disk 需要一个设备路径, 例如 --disk /dev/sdb' \
+                            '--disk needs a device path, e.g. --disk /dev/sdb')"
           exit 2
         fi
         FORCE_DISK=$1 ;;
       --disk=*) FORCE_DISK=${1#--disk=} ;;
-      -*) log_err "未知选项: $1"; usage; exit 2 ;;
+      -*) log_err "$(zh_en "未知选项: $1" "Unknown option: $1")"; usage; exit 2 ;;
       *) FW_ARG=$1 ;;
     esac
     shift
@@ -947,10 +1128,14 @@ main() {
   # 否则汉字宽度算错 -> 菜单乱码/退不出去, 详见 ui_setup 上方说明)
   ui_setup
 
+  # 诊断是只读操作, 不需要 root
+  if [ "$MODE" = "diag" ]; then show_diag; exit 0; fi
+
   # 写盘/改网络都需要 root
   if [ "$(id -u 2>/dev/null || echo 0)" != "0" ]; then
-    log_err "需要 root 权限运行 (当前 uid 非 0)。请用 root 登录后重试。"
-    echo "(查看用法: $0 --help)"
+    log_err "$(zh_en '需要 root 权限运行 (当前 uid 非 0)。请用 root 登录后重试。' \
+                      'Must run as root (current uid is not 0). Log in as root and retry.')"
+    echo "( $(zh_en '查看用法' 'usage'): $0 --help )"
     exit 1
   fi
 

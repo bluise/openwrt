@@ -101,6 +101,7 @@ openwrt
 │  5) 查看网络接口                          │
 │  6) 显示扩容命令(如需要)                  │
 │  7) 设置网口模式(单网卡/双网卡)           │
+│  8) 诊断(装不上时先看这个)                │
 │  0) 退出                                  │
 └───────────────────────────────────────────┘
 ```
@@ -108,7 +109,14 @@ openwrt
 **退出菜单**：选 `0`、按 `Esc`、或点"退出"按钮都可以（纯文本菜单还可以输 `q`，
 Ctrl+D 也行）—— 不会出现"退不出去"的情况。
 
+**安装失败一定会看得到原因**：安装过程既实时显示，也同步存一份日志，结束后用对话框
+把**完整过程**呈现出来（可上下翻页），标题会写 `安装完成` 还是 `安装失败 / 返回码 N`。
+以前失败信息会被菜单重绘立刻刷掉，看着就像"装不上但没有任何提示"。
+
 ### 菜单里中文是乱码怎么办
+
+> 一句话：**本机控制台（`TERM=linux`）永远显示不了中文**——那种终端没有中文字形，
+> 脚本会自动改用纯 ASCII 英文界面。乱码只会出现在"该终端不支持中文"的情况下。
 
 `whiptail` 基于 newt + slang，而 musl **没有 locale 数据**、固件默认也不设 `LANG`。
 slang 是靠 `setlocale`/`nl_langinfo`/`LC_ALL`/`LC_CTYPE` 判断"要不要进 UTF-8 模式"的：
@@ -127,6 +135,27 @@ openwrt-install --en     # 或 OPENWRT_UI=en openwrt-install
 
 `TERM` 为 `linux`/`dumb`/空（通常就是本机控制台）时会**自动**用英文界面；
 用 `--zh` 可以强制回中文。哪一种是你的情况，看 `echo $TERM` 和 SSH 客户端的编码设置。
+
+**英文界面是"全英文"**：菜单、对话框、倒计时、磁盘/固件搜索日志、空间报告、
+用法说明全部是 ASCII，不会再夹着汉字乱码。
+
+### 装不上时怎么排查
+
+菜单里选 `8`（或跑 `openwrt-install --diag`）会打印一份诊断，一眼看清哪一步不满足：
+
+- 识别到的整盘、各自容量型号
+- 启动盘解析结果（`/rom` 的源设备 → 整盘）与**每块盘为什么被排除/入选**
+- 所有分区归属哪块盘、是不是 USB
+- 固件镜像在 `/mnt`、`/media`、`/boot`、`/mnt/usb` 里到底找到没有
+- `whiptail`/`sfdisk`/`resize2fs`/`e2fsck`/`gunzip` 等工具在不在
+- 磁盘挂载情况与空闲空间
+
+两个最常见的失败原因：
+
+1. **找不到固件**：`openwrt-*-combined-efi.img.gz` 没放在设备上。把它放到 U 盘
+   （或任意可读路径），或直接指定：`openwrt-install --no-menu /path/to/xxx.img.gz`
+2. **只有一块盘、而它正是当前启动盘**：脚本会**拒绝**写它（避免把正在运行的
+   系统就地清空）。要么从 U 盘启动后再装，要么用 `sysupgrade` 升级。
 
 选 `1` 安装，脚本会：
 1. 自动识别**可写入的硬盘**：排除当前启动盘与所有 USB 设备（判据直接读 sysfs，
@@ -159,7 +188,8 @@ openwrt-install --en     # 或 OPENWRT_UI=en openwrt-install
 openwrt                            # 打开菜单(带方向键选择)
 openwrt-install --no-menu          # 跳过菜单, 直接一键安装
 openwrt-install --change-ip        # 只改 LAN 口 IP
-openwrt-install --en               # 英文(纯 ASCII)菜单, 中文乱码时用
+openwrt-install --en               # 英文(纯 ASCII)菜单与全部输出, 中文乱码时用
+openwrt-install --diag             # 诊断: 磁盘/启动盘/候选判定/固件搜索/工具
 openwrt-install -h                 # 查看全部用法
 openwrt-install --no-menu /path/to/openwrt-*.img.gz   # 指定固件
 openwrt-install --no-menu --disk /dev/sdb             # 指定目标盘(多块盘时必用)
