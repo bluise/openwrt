@@ -6,7 +6,7 @@ GitHub Actions 在线自动构建 OpenWrt 25.12 x86_64 固件（基于官方 Ima
 
 - **OpenWrt 25.12** (x86_64 / UEFI, squashfs + ext4)
 - **OpenClash** 科学上网插件
-- **OpenAppFilter (OAF)** 应用过滤
+- **OpenAppFilter (OAF)** 应用过滤（含中文界面：内置 `luci-i18n-oaf-zh-cn` 语言包）
 - **Realtek RTL8111/8168** 内置有线网卡驱动 (r8169)
 - **RTL8153** USB 网卡驱动 (`kmod-usb-net-rtl8152`)
 - **MT7922** 无线网卡驱动 (mt7921e + 固件)
@@ -105,6 +105,29 @@ openwrt
 └───────────────────────────────────────────┘
 ```
 
+**退出菜单**：选 `0`、按 `Esc`、或点"退出"按钮都可以（纯文本菜单还可以输 `q`，
+Ctrl+D 也行）—— 不会出现"退不出去"的情况。
+
+### 菜单里中文是乱码怎么办
+
+`whiptail` 基于 newt + slang，而 musl **没有 locale 数据**、固件默认也不设 `LANG`。
+slang 是靠 `setlocale`/`nl_langinfo`/`LC_ALL`/`LC_CTYPE` 判断"要不要进 UTF-8 模式"的：
+判定失败时它把每个汉字当成两个单字节字符，宽度算错，于是边框画歪、条目串行
+（看着就是乱码），底部的"退出"也可能看不到、点不准。
+
+脚本现在会自己设 `LC_ALL=C.UTF-8`，让 slang 进入 UTF-8 模式（libnewt 编译时带了
+`_newt_wstrlen`，会用 `mbrtowc`/`wcwidth` 按双宽计算），中文就正常了。
+
+如果还有乱码，说明**终端本身显示不了中文**（本机控制台没有中文字形，或 SSH 客户端
+用的是 GBK 编码），此时用纯 ASCII 英文界面：
+
+```sh
+openwrt-install --en     # 或 OPENWRT_UI=en openwrt-install
+```
+
+`TERM` 为 `linux`/`dumb`/空（通常就是本机控制台）时会**自动**用英文界面；
+用 `--zh` 可以强制回中文。哪一种是你的情况，看 `echo $TERM` 和 SSH 客户端的编码设置。
+
 选 `1` 安装，脚本会：
 1. 自动识别**可写入的硬盘**：排除当前启动盘与所有 USB 设备（判据直接读 sysfs，
    不依赖固件里根本没有的 `lsblk`）
@@ -136,6 +159,7 @@ openwrt
 openwrt                            # 打开菜单(带方向键选择)
 openwrt-install --no-menu          # 跳过菜单, 直接一键安装
 openwrt-install --change-ip        # 只改 LAN 口 IP
+openwrt-install --en               # 英文(纯 ASCII)菜单, 中文乱码时用
 openwrt-install -h                 # 查看全部用法
 openwrt-install --no-menu /path/to/openwrt-*.img.gz   # 指定固件
 openwrt-install --no-menu --disk /dev/sdb             # 指定目标盘(多块盘时必用)

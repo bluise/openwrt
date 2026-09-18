@@ -6,6 +6,8 @@
 #   - 自动识别内置盘并**排除启动盘与U盘**, 判断全部读 sysfs
 #     (不能用 lsblk: 固件里没有该命令, 详见下面的说明)
 #   - 多块候选盘时列出让你选; 非交互环境不会瞎猜, 必须用 --disk 指定
+#   - 界面默认中文; 终端显示不了中文时用 --en 切纯 ASCII 英文
+#     (退出菜单: 0 / Esc / "退出"按钮; 纯文本菜单还可输 q)
 #   - 写入后只读检测空间: rootfs 固定 2048 MiB 为设计目标, 剩余空间保持未分配
 #     (只读探测, 不自动修改分区表; 需要扩容时会打印具体命令)
 # =============================================
@@ -20,6 +22,58 @@ NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_err()   { echo -e "${RED}[ERROR]${NC} $*"; }
+
+# =============================================
+# 界面语言 / 终端编码
+# =============================================
+# 为什么必须显式设 locale:
+#   whiptail 基于 newt+slang, 而 musl 没有 locale 数据、固件也不设 LANG。
+#   libslang 是靠 setlocale/nl_langinfo/LC_ALL/LC_CTYPE 判断"要不要进 UTF-8
+#   模式"的 —— 判定失败时它按"一个字节=一个字符"处理, 每个汉字被当成两个
+#   字符: 宽度算错 → 菜单边框画歪、条目错位串行(看着就是乱码), 底部"退出"
+#   看不见也点不准(这就是"菜单乱码 + 退不出去"的根因)。
+#   显式给一个 UTF-8 locale 后 slang 进入 UTF-8 模式, libnewt 用
+#   mbrtowc/wcwidth 按双宽计算(它编译时带了 _newt_wstrlen), 中文与边框都正常。
+#
+# 但终端本身显示不了中文时(本机控制台没有中文字形, 或 SSH 客户端用 GBK),
+# 宽度算得再对也没用。所以交互界面(菜单/对话框/提示)提供纯 ASCII 英文:
+#   openwrt-install --en        强制英文界面
+#   openwrt-install --zh        强制中文界面
+#   OPENWRT_UI=en|zh            同样效果的环境变量
+# 默认: TERM 为空/dumb/linux(通常就是本机控制台)时用英文, 其余用中文。
+# 报告正文(空间检测那一段)不翻译: 里面主要是路径/扇区/命令, 本身是 ASCII。
+UI_FORCE=""
+UI_EN=""
+
+ui_setup() {
+  lang=${UI_FORCE:-${OPENWRT_UI:-auto}}
+  case "$lang" in
+    en|EN|English|english) UI_EN=1 ;;
+    zh|ZH|Chinese|chinese) UI_EN="" ;;
+    *)
+      case "${TERM:-}" in
+        ""|dumb|linux) UI_EN=1 ;;
+        *) UI_EN="" ;;
+      esac ;;
+  esac
+  if [ "$UI_EN" = "1" ]; then
+    return 0
+  fi
+  # musl 认 C.UTF-8; slang 看到 UTF-8 就开双宽处理
+  LC_ALL=C.UTF-8
+  LANG=C.UTF-8
+  export LC_ALL LANG
+  return 0
+}
+
+# 双语取值: zh_en '中文' 'English'
+zh_en() {
+  if [ "$UI_EN" = "1" ]; then
+    printf '%s' "$2"
+  else
+    printf '%s' "$1"
+  fi
+}
 
 # ---------- 1. 确定目标磁盘(排除启动盘与U盘) ----------
 # 判断依据全部来自 sysfs, 不用 lsblk:
@@ -297,8 +351,11 @@ find_firmware() {
 
 # ---------- 3. 倒计时 ----------
 countdown() {
-  log_warn "5秒后将把 $FW 写入 $TARGET  ($(disk_desc "$(basename "$TARGET")"))"
-  log_warn "该操作会清空 $TARGET 上的所有数据! (Ctrl+C 可取消)"
+  # 这条警告是最关键的安全提示, 英文界面下也必须看得懂
+  log_warn "$(zh_en "5秒后将把 $FW 写入 $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
+                    "Writing $FW to $TARGET  ($(disk_desc "$(basename "$TARGET")")) in 5 seconds")"
+  log_warn "$(zh_en "该操作会清空 $TARGET 上的所有数据! (Ctrl+C 可取消)" \
+                    "ALL DATA on $TARGET will be erased! (Ctrl+C to abort)")"
   i=5
   while [ $i -gt 0 ]; do
     echo -n "$i... "; i=$((i-1)); sleep 1
@@ -489,7 +546,11 @@ msg() { # $1=标题 $2=内容
   if [ -n "$HAS_WT" ]; then
     whiptail --title "$1" --msgbox "$2" 18 74
   else
-    echo "===== $1 ====="; echo "$2"; echo; printf '按回车继续...'; read _x
+    echo "===== $1 ====="
+    printf '%b\n' "$2"
+    echo
+    printf '%s' "$(zh_en '按回车继续...' 'Press Enter to continue...')"
+    read _x
   fi
 }
 
@@ -497,7 +558,10 @@ confirm() { # $1=标题 $2=内容 -> 0=确认
   if [ -n "$HAS_WT" ]; then
     whiptail --title "$1" --yesno "$2" 16 74
   else
-    echo "===== $1 ====="; echo "$2"; printf '确认执行? [y/N] '; read _a
+    echo "===== $1 ====="
+    printf '%b\n' "$2"
+    printf '%s' "$(zh_en '确认执行? [y/N] ' 'Continue? [y/N] ')"
+    read _a
     case "$_a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
   fi
 }
@@ -532,27 +596,34 @@ valid_ipv4() {
 change_lan_ip() {
   CUR=$(uci -q get network.lan.ipaddr 2>/dev/null || true)
   [ -n "$CUR" ] || CUR=10.0.0.1
-  NEW=$(input_box "修改 LAN 口 IP" "请输入新的 LAN 口 IP 地址 (当前 $CUR):" "$CUR") || return 0
+  NEW=$(input_box "$(zh_en '修改 LAN 口 IP' 'Change LAN IP')" \
+    "$(zh_en "请输入新的 LAN 口 IP 地址 (当前 $CUR):" "New LAN IP address (current $CUR):")" "$CUR") || return 0
   [ -n "$NEW" ] || return 0
   if ! valid_ipv4 "$NEW"; then
-    msg "错误" "'$NEW' 不是合法的 IPv4 地址。"
+    msg "$(zh_en '错误' 'Error')" "$(zh_en "'$NEW' 不是合法的 IPv4 地址。" "'$NEW' is not a valid IPv4 address.")"
     return 1
   fi
-  if confirm "确认修改" "将把 LAN 口 IP 改为 $NEW\n\n注意: 修改后当前连接会断开, 需要访问新地址、或重新获取 DHCP。\n是否继续?"; then
-    uci set network.lan.ipaddr="$NEW" || { msg "错误" "写入 uci 失败"; return 1; }
+  if confirm "$(zh_en '确认修改' 'Confirm change')" \
+     "$(zh_en "将把 LAN 口 IP 改为 $NEW\n\n注意: 修改后当前连接会断开, 需要访问新地址、或重新获取 DHCP。\n是否继续?" \
+                "LAN IP will be changed to $NEW\n\nYour current connection will drop.\nContinue?")"; then
+    uci set network.lan.ipaddr="$NEW" || { msg "$(zh_en '错误' 'Error')" "$(zh_en '写入 uci 失败' 'Failed to write uci')"; return 1; }
     uci commit network
     if [ -n "$HAS_WT" ]; then
-      whiptail --title "已修改" --infobox "正在应用网络配置...\n\n新地址: http://$NEW" 10 60
+      whiptail --title "$(zh_en '已修改' 'Changed')" \
+        --infobox "$(zh_en "正在应用网络配置...\n\n新地址: http://$NEW" "Applying network config...\n\nNew address: http://$NEW")" 10 60
     fi
     /etc/init.d/network reload >/dev/null 2>&1 || service network reload >/dev/null 2>&1 || true
-    msg "完成" "LAN 口 IP 已改为: $NEW\n\n请用浏览器访问  http://$NEW\n若当前连接已断开, 请到新网段重新连接。"
+    msg "$(zh_en '完成' 'Done')" \
+      "$(zh_en "LAN 口 IP 已改为: $NEW\n\n请用浏览器访问  http://$NEW\n若当前连接已断开, 请到新网段重新连接。" \
+                 "LAN IP is now: $NEW\n\nOpen http://$NEW\nReconnect from the new subnet if the link dropped.")"
   fi
 }
 
 # 修改 root 密码
 change_password() {
-  if confirm "修改密码" "接下来会调用 passwd, 请按提示输入两次新密码。\n\n是否继续?"; then
-    passwd root || msg "提示" "密码修改未完成或已取消。"
+  if confirm "$(zh_en '修改密码' 'Change password')" \
+     "$(zh_en '接下来会调用 passwd, 请按提示输入两次新密码。\n\n是否继续?' 'passwd will run for root. Enter the new password twice.\n\nContinue?')"; then
+    passwd root || msg "$(zh_en '提示' 'Notice')" "$(zh_en '密码修改未完成或已取消。' 'Password change was not completed.')"
   fi
 }
 
@@ -576,32 +647,35 @@ set_nic_mode() {
   NICS=$(list_nics | tr '\n' ' ')
   N=$(list_nics | wc -l | tr -d ' ')
   if [ "$N" -eq 0 ]; then
-    msg "错误" "未检测到物理以太网口。\n若使用 USB 网卡, 请确认已插好或已装驱动。"
+    msg "$(zh_en '错误' 'Error')" \
+      "$(zh_en '未检测到物理以太网口。\n若使用 USB 网卡, 请确认已插好或已装驱动。' \
+                 'No physical Ethernet port found.\nIf you use a USB NIC, check it is plugged in / driver loaded.')"
     return 1
   fi
   CUR=$(uci -q get network.wan.device 2>/dev/null || true)
   CURW=$(uci -q get network.lan.device 2>/dev/null || true)
   if [ -n "$CUR" ]; then
-    MODE_DESC="当前: 双网卡 (LAN=$CURW, WAN=$CUR)"
+    MODE_DESC=$(zh_en "当前: 双网卡 (LAN=$CURW, WAN=$CUR)" "Now: dual NIC (LAN=$CURW, WAN=$CUR)")
   else
-    MODE_DESC="当前: 单网卡 (全部作 LAN)"
+    MODE_DESC=$(zh_en "当前: 单网卡 (全部作 LAN)" "Now: single NIC (all as LAN)")
   fi
 
   if [ -n "$HAS_WT" ]; then
-    CHOICE=$(whiptail --title "网口模式" --menu \
-      "检测到物理网口: $NICS\n$MODE_DESC\n\n请选择:" 18 76 3 \
-      "single" "单网卡模式: 唯一网口作为 LAN (直接可管理)" \
-      "dual"   "双网卡模式: 第一个为 WAN(DHCP), 其余为 LAN" \
-      "auto"   "自动按网口数量判断" \
+    CHOICE=$(whiptail --title "$(zh_en '网口模式' 'NIC mode')" --menu \
+      "$(zh_en "检测到物理网口: $NICS\n$MODE_DESC\n\n请选择:" "Physical NICs: $NICS\n$MODE_DESC\n\nChoose:")" 18 76 3 \
+      "single" "$(zh_en '单网卡模式: 唯一网口作为 LAN (直接可管理)' 'Single NIC: the only NIC becomes LAN (static, manageable)')" \
+      "dual"   "$(zh_en '双网卡模式: 第一个为 WAN(DHCP), 其余为 LAN' 'Dual NIC: first is WAN (DHCP), rest form the LAN bridge')" \
+      "auto"   "$(zh_en '自动按网口数量判断' 'Auto by NIC count')" \
       3>&1 1>&2 2>&3) || return 0
   else
     echo ""
-    echo "检测到物理网口: $NICS"
+    echo "$(zh_en "检测到物理网口: $NICS" "Physical NICs: $NICS")"
     echo "$MODE_DESC"
-    echo "  1) 单网卡模式 (唯一网口作为 LAN)"
-    echo "  2) 双网卡模式 (第一个为 WAN, 其余为 LAN)"
-    echo "  3) 自动判断"
-    printf '请输入编号并回车 [3]: '; read -r NT
+    echo "  1) $(zh_en '单网卡模式 (唯一网口作为 LAN)' 'Single NIC (only NIC becomes LAN)')"
+    echo "  2) $(zh_en '双网卡模式 (第一个为 WAN, 其余为 LAN)' 'Dual NIC (first = WAN, rest = LAN)')"
+    echo "  3) $(zh_en '自动判断' 'Auto')"
+    printf '%s' "$(zh_en '请输入编号并回车 [3]: ' 'Enter number [3]: ')"
+    read -r NT
     case "${NT:-3}" in
       1) CHOICE=single ;; 2) CHOICE=dual ;; *) CHOICE=auto ;;
     esac
@@ -627,7 +701,8 @@ set_nic_mode() {
     uci set network.lan.device="$FIRST"
     for d in $REST; do uci add_list network.lan.device="$d" 2>/dev/null || true; done
     # 单网卡时 LAN 会自动成为 DHCP 客户端? 不 —— 保持静态地址便于管理
-    RESULT="单网卡模式: $NICS 全部作为 LAN (静态 $(uci -q get network.lan.ipaddr 2>/dev/null || echo 未设置))"
+    RESULT=$(zh_en "单网卡模式: $NICS 全部作为 LAN (静态 $(uci -q get network.lan.ipaddr 2>/dev/null || echo 未设置))" \
+                   "Single NIC mode: $NICS all as LAN (static $(uci -q get network.lan.ipaddr 2>/dev/null || echo unset))")
   else
     # 双网卡: 首个作 WAN, 其余作 LAN 桥
     uci -q delete network.lan.device 2>/dev/null || true
@@ -650,12 +725,14 @@ set_nic_mode() {
     uci set network.wan6=interface
     uci set network.wan6.device="$FIRST"
     uci set network.wan6.proto='dhcpv6'
-    RESULT="双网卡模式: WAN=$FIRST, LAN=${REST:-无}"
+    RESULT=$(zh_en "双网卡模式: WAN=$FIRST, LAN=${REST:-无}" "Dual NIC mode: WAN=$FIRST, LAN=${REST:-none}")
   fi
 
   uci commit network
   /etc/init.d/network reload >/dev/null 2>&1 || service network reload >/dev/null 2>&1 || true
-  msg "完成" "$RESULT\n\n网络配置已重载。若管理页面失联, 请按新地址访问或检查网线插口。"
+  msg "$(zh_en '完成' 'Done')" \
+    "$RESULT\n\n$(zh_en '网络配置已重载。若管理页面失联, 请按新地址访问或检查网线插口。' \
+                             'Network config reloaded. If the UI is unreachable, use the new address or check the cable.')"
 }
 
 # 显示网络接口与地址
@@ -663,57 +740,61 @@ show_interfaces() {
   TXT=$(ip -4 addr show 2>/dev/null | awk '/^[0-9]+:/{iface=$2} /inet /{print iface" "$2}' | sed 's/:$//' | head -20)
   [ -n "$TXT" ] || TXT=$(ifconfig -a 2>/dev/null | head -20)
   LAN=$(uci -q get network.lan.ipaddr 2>/dev/null || true)
-  msg "网络接口" "LAN 管理地址: ${LAN:-未知}\n(设备名 eth0/eth1 等, 取决于网卡)\n\n$TXT"
+  msg "$(zh_en '网络接口' 'Network interfaces')" \
+    "$(zh_en "LAN 管理地址: ${LAN:-未知}" "LAN address: ${LAN:-unknown}")$(zh_en '\n(设备名 eth0/eth1 等, 取决于网卡)' '\n(names like eth0/eth1 depend on the NIC)')\n\n$TXT"
 }
 
 # 纯文本菜单兜底: 没有 whiptail 或没有终端时使用。
 # 仍然是"选择"而不是记命令 —— 输入编号回车即可。
+# 退出方式: 0 / q / quit / exit / 空回车 / Ctrl-D(EOF)。
 text_menu() {
   while :; do
     cat <<EOF
 
-======== OpenWrt 安装助手 ========
-  1) 安装系统到内置硬盘 (会清空目标盘!)
-  2) 查看磁盘与空间状态
-  3) 修改 LAN 口 IP 地址
-  4) 修改 root 密码
-  5) 查看网络接口
-  6) 显示扩容命令(如需要)
-  7) 设置网口模式(单网卡/双网卡)
-  0) 退出
-==================================
+======== $(zh_en 'OpenWrt 安装助手' 'OpenWrt Installer') ========
+  1) $(zh_en '安装系统到内置硬盘 (会清空目标盘!)' 'Install to internal disk (ERASES the target disk!)')
+  2) $(zh_en '查看磁盘与空间状态' 'Show disks and space status')
+  3) $(zh_en '修改 LAN 口 IP 地址' 'Change LAN IP address')
+  4) $(zh_en '修改 root 密码' 'Change root password')
+  5) $(zh_en '查看网络接口' 'Show network interfaces')
+  6) $(zh_en '显示扩容命令(如需要)' 'Show resize commands (if needed)')
+  7) $(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')
+  0) $(zh_en '退出 (输入 q 也可以)' 'Quit (or type q)')
+========================================
 EOF
-    printf '请输入编号并回车: '
-    read -r N
+    printf '%s' "$(zh_en '请输入编号并回车: ' 'Enter a number and press Enter: ')"
+    read -r N || N=0        # Ctrl-D / EOF 一律当作退出
     case "$N" in
       1)
-        printf '确认把固件写入内置硬盘(会清空目标盘)? [y/N] '; read -r A
-        case "$A" in y|Y) do_install || true ;; *) echo "已取消" ;; esac
+        printf '%s' "$(zh_en '确认把固件写入内置硬盘(会清空目标盘)? [y/N] ' 'Write firmware to the internal disk (ERASES it)? [y/N] ')"
+        read -r A
+        case "$A" in y|Y) do_install || true ;; *) echo "$(zh_en '已取消' 'Cancelled')" ;; esac
         ;;
       2|6)
         if find_target_disk --first >/dev/null 2>&1; then
           post_install_space_report "$TARGET" || true
         else
-          echo "未找到可用的硬盘(详见上面的排除原因)。"
+          echo "$(zh_en '未找到可用的硬盘(详见上面的排除原因)。' 'No writable disk found (see the reasons above).')"
         fi
         ;;
       3)
-        printf '请输入新的 LAN 口 IP: '; read -r NIP
+        printf '%s' "$(zh_en '请输入新的 LAN 口 IP: ' 'New LAN IP: ')"
+        read -r NIP
         if [ -n "$NIP" ]; then
           if valid_ipv4 "$NIP"; then
             uci set network.lan.ipaddr="$NIP" && uci commit network && \
               /etc/init.d/network reload >/dev/null 2>&1 || true
-            echo "LAN 口 IP 已改为 $NIP (如连接断开请访问新地址)"
+            echo "$(zh_en "LAN 口 IP 已改为 $NIP (如连接断开请访问新地址)" "LAN IP changed to $NIP (reconnect at the new address if the link dropped)")"
           else
-            echo "不是合法的 IPv4 地址: $NIP"
+            echo "$(zh_en "不是合法的 IPv4 地址: $NIP" "Not a valid IPv4 address: $NIP")"
           fi
         fi
         ;;
       4) passwd root ;;
       5) show_interfaces ;;
       7) set_nic_mode || true ;;
-      0|"") echo "已退出"; return 0 ;;
-      *) echo "无效编号: $N" ;;
+      0|q|Q|quit|QUIT|exit|EXIT|"") echo "$(zh_en '已退出' 'Bye')"; return 0 ;;
+      *) echo "$(zh_en "无效编号: $N" "Invalid input: $N")" ;;
     esac
   done
 }
@@ -721,20 +802,24 @@ EOF
 # 主菜单
 main_menu() {
   while :; do
-    CHOICE=$(whiptail --title "OpenWrt 安装助手" --menu \
-      "请选择要执行的操作:" 21 76 8 \
-      "1" "安装系统到内置硬盘 (会清空目标盘!)" \
-      "2" "查看磁盘与空间状态" \
-      "3" "修改 LAN 口 IP 地址" \
-      "4" "修改 root 密码" \
-      "5" "查看网络接口" \
-      "6" "显示扩容命令(如需要)" \
-      "7" "设置网口模式(单网卡/双网卡)" \
-      "0" "退出" \
+    # --cancel-button: Esc 或"取消"按钮都直接退出(菜单项被截断时也能退出来)
+    CHOICE=$(whiptail --title "$(zh_en 'OpenWrt 安装助手' 'OpenWrt Installer')" \
+      --cancel-button "$(zh_en '退出' 'Quit')" --menu \
+      "$(zh_en '请选择要执行的操作 (Esc=退出):' 'Select an action (Esc = quit):')" 21 76 8 \
+      "1" "$(zh_en '安装系统到内置硬盘 (会清空目标盘!)' 'Install to internal disk (ERASES the target disk!)')" \
+      "2" "$(zh_en '查看磁盘与空间状态' 'Show disks and space status')" \
+      "3" "$(zh_en '修改 LAN 口 IP 地址' 'Change LAN IP address')" \
+      "4" "$(zh_en '修改 root 密码' 'Change root password')" \
+      "5" "$(zh_en '查看网络接口' 'Show network interfaces')" \
+      "6" "$(zh_en '显示扩容命令(如需要)' 'Show resize commands (if needed)')" \
+      "7" "$(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')" \
+      "0" "$(zh_en '退出' 'Quit')" \
       3>&1 1>&2 2>&3) || return 0
     case "$CHOICE" in
       1)
-        if confirm "确认安装" "即将把固件写入内置硬盘, 目标盘上的所有数据都会被清空。\n\n是否继续?"; then
+        if confirm "$(zh_en '确认安装' 'Confirm install')" \
+           "$(zh_en '即将把固件写入内置硬盘, 目标盘上的所有数据都会被清空。\n\n是否继续?' \
+                      'The firmware will be written to the internal disk.\nALL DATA on the target disk will be erased.\n\nContinue?')"; then
           do_install || true
         fi
         ;;
@@ -745,19 +830,20 @@ main_menu() {
           TXT=$(sed 's/\x1b\[[0-9;]*m//g' "$TMPF" 2>/dev/null)
           rm -f "$TMPF"
           if [ "$CHOICE" = "2" ]; then
-            msg "磁盘与空间状态" "${TXT:-未获取到信息}"
+            msg "$(zh_en '磁盘与空间状态' 'Disks and space')" "${TXT:-$(zh_en '未获取到信息' 'no information')}"
           else
-            msg "扩容命令" "${TXT:-当前无需扩容}"
+            msg "$(zh_en '扩容命令' 'Resize commands')" "${TXT:-$(zh_en '当前无需扩容' 'no resize needed')}"
           fi
         else
-          msg "错误" "未找到可用的硬盘(启动盘与 USB 设备已被排除)。"
+          msg "$(zh_en '错误' 'Error')" \
+            "$(zh_en '未找到可用的硬盘(启动盘与 USB 设备已被排除)。' 'No writable disk found (boot disk and USB devices are excluded).')"
         fi
         ;;
       3) change_lan_ip || true ;;
       4) change_password ;;
       5) show_interfaces ;;
       7) set_nic_mode || true ;;
-      0|"") return 0 ;;
+      0|q|Q|quit|"") return 0 ;;
     esac
   done
 }
@@ -768,7 +854,7 @@ do_install() {
   find_firmware "$@" || return 1
   countdown
 
-  log_info "解压并写入镜像..."
+  log_info "$(zh_en '解压并写入镜像...' 'Decompressing and writing the image...')"
   if command -v gunzip >/dev/null 2>&1; then
     gunzip -c "$FW" | dd of="$TARGET" bs=4M conv=fsync
   else
@@ -779,7 +865,8 @@ do_install() {
   # 只读探测 (不自动改分区表)
   post_install_space_report "$TARGET" || true
 
-  log_info "安装完成! 请拔掉U盘重启, 首次启动约需2-3分钟."
+  log_info "$(zh_en '安装完成! 请拔掉U盘重启, 首次启动约需2-3分钟.' \
+                    'Done! Unplug the USB stick and reboot; first boot takes 2-3 minutes.')"
 
   # 这里是"重启后怎么进去"的提示, 必须按当前 uci 配置来读。
   # 原先硬编码 "10.0.0.1 (LAN口 eth1)": 一旦用菜单 7 改过网口模式,
@@ -791,7 +878,8 @@ do_install() {
     PORTS=$(uci -q get network.@device[0].ports 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)
     [ -n "$PORTS" ] && LAN_DEV="br-lan($PORTS)"
   fi
-  log_info "管理地址: http://${LAN_IP:-<见 /etc/config/network>}   LAN 口: ${LAN_DEV:-<见 /etc/config/network>}"
+  log_info "$(zh_en "管理地址: http://${LAN_IP:-<见 /etc/config/network>}   LAN 口: ${LAN_DEV:-<见 /etc/config/network>}" \
+                    "Management: http://${LAN_IP:-<see /etc/config/network>}   LAN port: ${LAN_DEV:-<see /etc/config/network>}")"
   return 0
 }
 
@@ -806,7 +894,12 @@ usage() {
   --disk <设备>   指定目标盘, 例如 --disk /dev/sdb
                   (多块盘且非交互环境下**必须**用它; 也接受
                    OPENWRT_TARGET_DISK=/dev/sdb 环境变量)
+  --en / --zh     菜单用英文(纯 ASCII) / 中文; 等价于 OPENWRT_UI=en|zh
+                  终端显示不了中文时(本机控制台没中文字形、或 SSH 客户端
+                  用 GBK)用 --en; 本机控制台(TERM=linux)会自动选英文。
   -h, --help      显示本帮助
+
+菜单退出: 选 0 / 按 Esc / 点"退出"按钮 都可以; 纯文本菜单还可输 q。
 
 目标盘的选择规则:
   排除 启动盘 与 所有 USB 设备 -> 唯一候选直接用
@@ -815,6 +908,7 @@ usage() {
 
 示例:
   openwrt-install                                  # 菜单模式
+  openwrt-install --en                             # 英文菜单(终端不支持中文时)
   openwrt-install --no-menu                        # 一键安装(自动找固件/目标盘)
   openwrt-install --no-menu /mnt/sda1/xxx.img.gz   # 指定固件
   openwrt-install --no-menu --disk /dev/sdb        # 指定目标盘
@@ -833,6 +927,8 @@ main() {
       -h|--help) usage; exit 0 ;;
       --no-menu) MODE=install ;;
       --change-ip) MODE=changeip ;;
+      --en|--english) UI_FORCE=en ;;
+      --zh|--chinese) UI_FORCE=zh ;;
       --disk)
         shift
         if [ -z "${1:-}" ]; then
@@ -846,6 +942,10 @@ main() {
     esac
     shift
   done
+
+  # 界面语言 + UTF-8 locale(必须在任何 whiptail 调用之前,
+  # 否则汉字宽度算错 -> 菜单乱码/退不出去, 详见 ui_setup 上方说明)
+  ui_setup
 
   # 写盘/改网络都需要 root
   if [ "$(id -u 2>/dev/null || echo 0)" != "0" ]; then
