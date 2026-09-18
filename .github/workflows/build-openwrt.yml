@@ -309,11 +309,13 @@ jobs:
         run: |
           set -euo pipefail
           # 官方源里没有 luci-theme-argon(iStoreOS 用的就是自己 fork 的 Argon),
-          # 所以把它当作"自定义文件"直接打进固件 —— 主题就是一堆静态文件:
-          #   htdocs/*  -> /www/                 (CSS/JS/图片)
-          #   ucode/*   -> /usr/share/ucode/     (LuCI 25.x 用的 ucode 模板)
-          #   root/*    -> /                     (含 etc/uci-defaults/30_luci-theme-argon,
-          #                                       首次启动会把 Argon 设为默认主题)
+          # 所以把它当作"自定义文件"直接打进固件。目标路径必须与 LuCI 的
+          # luci.mk 一致(否则文件在, LuCI 却找不到, 界面还是默认布局):
+          #   htdocs/*  -> /www/                    (luci.mk: HTDOCS=/www)
+          #   ucode/*   -> /usr/share/ucode/luci/   (luci.mk: UCODE_LIBRARYDIR)
+          #   root/*    -> /                        (含 etc/uci-defaults/30_luci-theme-argon)
+          # 踩过的坑: 一开始把 ucode 放成 /usr/share/ucode/ 少了一层 luci/,
+          # CSS 加载了但布局仍是默认的(真机反馈"还是老样子")。
           TMP=$(mktemp -d)
           curl -fsSL -o "$TMP/argon.tar.gz" \
             "https://github.com/jerrykuku/luci-theme-argon/archive/${ARGON_SHA}.tar.gz"
@@ -322,16 +324,24 @@ jobs:
           for d in htdocs ucode; do
             [ -d "$SRC/$d" ] || { echo "::error::Argon 源码里没有 $d/ (上游结构变了?)"; exit 1; }
           done
-          mkdir -p files/www files/usr/share/ucode
+          mkdir -p files/www files/usr/share/ucode/luci
           cp -a "$SRC/htdocs/." files/www/
-          cp -a "$SRC/ucode/."  files/usr/share/ucode/
+          cp -a "$SRC/ucode/."  files/usr/share/ucode/luci/
           [ -d "$SRC/root" ] && cp -a "$SRC/root/." files/
           # uci-defaults 与 rpcd 脚本必须可执行(本仓库 core.filemode=false, 权限位不跟着 git 走)
           find files/etc/uci-defaults -type f -exec chmod 755 {} + 2>/dev/null || true
           [ -f files/usr/libexec/rpcd/luci.argon_wallpaper ] && \
             chmod 755 files/usr/libexec/rpcd/luci.argon_wallpaper
           echo "==> Argon 静态文件 $(find files/www/luci-static/argon -type f | wc -l) 个"
+          echo "==> Argon ucode 模板 $(find files/usr/share/ucode/luci/template/themes/argon -type f | wc -l) 个"
           ls -l files/etc/uci-defaults/30_luci-theme-argon
+          # 必须落在 LuCI 真正会去找的目录(luci.mk 的 UCODE_LIBRARYDIR)
+          for f in header.ut footer.ut sysauth.ut; do
+            [ -f "files/usr/share/ucode/luci/template/themes/argon/$f" ] || {
+              echo "::error::Argon 模板 $f 不在 /usr/share/ucode/luci/template/themes/argon/"; exit 1; }
+          done
+          [ -f files/www/luci-static/argon/css/cascade.css ] || {
+            echo "::error::Argon 的 cascade.css 不在 /www/luci-static/argon/css/"; exit 1; }
           grep -q 'luci-static/argon' files/etc/uci-defaults/30_luci-theme-argon || {
             echo "::error::Argon 的 uci-defaults 没有把主题设为默认"; exit 1; }
           rm -rf "$TMP"
