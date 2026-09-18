@@ -27,6 +27,12 @@ log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
+# 版本号: 每次改动都换 —— 日志第一行就会打印, 用来判断机器上/镜像里跑的到底是哪一版
+# (真机上出过"脚本改了但跑的还是旧版"的扯皮, 有这一行就不用猜)
+INSTALL_VER="2026-09-19.2"
+INSTALL_MODE_ZH="分区复制安装: 只复制系统分区 + 在目标盘重建分区表(不再整盘 dd)"
+INSTALL_MODE_EN="partition-copy install: copies only the system partitions and rebuilds the target partition table"
+
 # =============================================
 # 界面语言 / 终端编码
 # =============================================
@@ -1358,6 +1364,8 @@ show_interfaces() {
 # 诊断: 装不上时先跑这个, 一眼看清是哪一步不满足条件
 show_diag() {
   echo "===== $(zh_en '诊断信息' 'Diagnostics') ====="
+  echo "$(zh_en "openwrt-install 版本 $INSTALL_VER" "openwrt-install version $INSTALL_VER")"
+  echo "$(zh_en "$INSTALL_MODE_ZH" "$INSTALL_MODE_EN")"
   echo "TERM=${TERM:-} LANG=${LANG:-} LC_ALL=${LC_ALL:-} UI_EN=${UI_EN:-0} uid=$(id -u 2>/dev/null)"
   echo
   echo "-- $(zh_en '整盘' 'disks') --"
@@ -1538,6 +1546,8 @@ do_install() {
   # 先把固件路径存进变量: find_target_disk 内部会用 set -- 拼 whiptail 参数,
   # 不能让它依赖调用者的位置参数("$@")。
   FW_PATH=$1
+  log_info "$(zh_en "openwrt-install 版本 $INSTALL_VER —— $INSTALL_MODE_ZH" \
+                    "openwrt-install version $INSTALL_VER - $INSTALL_MODE_EN")"
   CLONE=""
   find_target_disk || return 1
   # 默认且唯一的安装路径: 克隆当前运行的介质。不再搜索镜像文件、也不提供下载。
@@ -1608,6 +1618,7 @@ usage() {
   if [ "$UI_EN" = "1" ]; then
     cat <<EOF
 Usage: openwrt-install [options] [firmware.img.gz]
+       (version $INSTALL_VER - $INSTALL_MODE_EN)
 
   (no args)        interactive menu (recommended)
   --no-menu        skip the menu, install straight to the internal disk
