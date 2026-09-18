@@ -29,7 +29,7 @@ log_err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # 版本号: 每次改动都换 —— 日志第一行就会打印, 用来判断机器上/镜像里跑的到底是哪一版
 # (真机上出过"脚本改了但跑的还是旧版"的扯皮, 有这一行就不用猜)
-INSTALL_VER="2026-09-19.3"
+INSTALL_VER="2026-09-19.4"
 INSTALL_MODE_ZH="分区复制安装: 只复制系统分区 + 在目标盘重建分区表(不再整盘 dd)"
 INSTALL_MODE_EN="partition-copy install: copies only the system partitions and rebuilds the target partition table"
 
@@ -329,6 +329,14 @@ find_target_disk() {
   FIRST_ONLY=0
   [ "${1:-}" = "--first" ] && FIRST_ONLY=1
 
+  # 已经选好了就不再问第二遍: 菜单里的流程是"先选盘 -> 再弹确认框(写明盘名) -> 安装",
+  # do_install 末尾还会再调一次本函数, 那次直接沿用。
+  if [ -n "$TARGET" ] && [ "$FIRST_ONLY" != "1" ]; then
+    log_info "$(zh_en "目标盘: $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
+                      "Target disk: $TARGET  ($(disk_desc "$(basename "$TARGET")"))")"
+    return 0
+  fi
+
   TARGET=""
   BOOT_DISKS=$(find_boot_disks 2>/dev/null || true)
   if [ -n "$BOOT_DISKS" ]; then
@@ -394,9 +402,41 @@ find_target_disk() {
   fi
 
   if [ "$N" -eq 1 ]; then
-    TARGET="/dev/$(first_cand)"
-    log_info "$(zh_en "目标盘(唯一候选): $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
-                      "Target disk (only candidate): $TARGET  ($(disk_desc "$(basename "$TARGET")"))")"
+    only="/dev/$(first_cand)"
+    # 唯一候选盘也**必须**让用户点头: 否则看起来就是"没问我就开始克隆了"。
+    # (非交互环境 / --first 只读探测时才自动采用, 便于脚本调用)
+    if [ "$FIRST_ONLY" != "1" ]; then
+      if [ -n "$HAS_WT" ]; then
+        if whiptail --title "$(zh_en '选择目标盘' 'Select target disk')" \
+             --cancel-button "$(zh_en '取消' 'Cancel')" \
+             --yes-button "$(zh_en "就用 $only" "Use $only")" --yesno \
+             "$(zh_en "只检测到一块可写入的盘:\n\n  $only  ($(disk_desc "$(basename "$only")"))\n\n启动盘 /dev/${BOOT_DISKS} 与所有 USB 设备已排除。\n\n把它作为目标盘吗?(它上面的数据会被清空)" \
+                       "Only one writable disk was found:\n\n  $only  ($(disk_desc "$(basename "$only")"))\n\nThe boot disk /dev/${BOOT_DISKS} and all USB devices are excluded.\n\nUse it as the target? (ALL data on it will be erased)")" \
+             18 76; then
+          TARGET=$only
+          log_info "$(zh_en "目标盘(已确认): $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
+                            "Target disk (confirmed): $TARGET  ($(disk_desc "$(basename "$TARGET")"))")"
+          return 0
+        fi
+        log_info "$(zh_en '已取消' 'Cancelled')"
+        return 1
+      fi
+      have_tty || { TARGET=$only; log_info "$(zh_en "目标盘(唯一候选, 非交互环境): $TARGET" "Target disk (only candidate, non-interactive): $TARGET")"; return 0; }
+      log_info "$(zh_en "只检测到一块可写入的盘: $only  ($(disk_desc "$(basename "$only")"))" \
+                        "Only one writable disk was found: $only  ($(disk_desc "$(basename "$only")"))")"
+      printf '%s' "$(zh_en "把它作为目标盘吗? 该盘数据会被清空 [y/N] " \
+                        "Use it as the target? ALL data on it will be erased [y/N] ")"
+      read -r A || A=n
+      case "$A" in
+        y|Y) TARGET=$only
+             log_info "$(zh_en "目标盘(已确认): $TARGET" "Target disk (confirmed): $TARGET")"
+             return 0 ;;
+        *)   log_info "$(zh_en '已取消' 'Cancelled')"; return 1 ;;
+      esac
+    fi
+    TARGET=$only
+    log_info "$(zh_en "目标盘(唯一候选, 非交互环境): $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
+                      "Target disk (only candidate, non-interactive): $TARGET  ($(disk_desc "$(basename "$TARGET")"))")"
     return 0
   fi
 
@@ -1156,6 +1196,10 @@ EOF
 
 # 菜单需要: (1) 装了 whiptail (2) 有可用终端。
 # 只判断命令存在是不够的 —— 无终端时 whiptail 会直接失败。
+# 是否处于人机交互终端。集中成一个函数: 既能被测试覆盖(TTY_FORCE=1),
+# 也避免各处对 -t 0 的散乱判断。
+have_tty() { [ -n "${TTY_FORCE:-}" ] && return 0; [ -t 0 ]; }
+
 HAS_WT=""
 if command -v whiptail >/dev/null 2>&1; then
   if [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then
@@ -1503,9 +1547,11 @@ main_menu() {
       3>&1 1>&2 2>&3) || return 0
     case "$CHOICE" in
       1)
+        # 先选盘(会把盘名/容量摆出来让人确认), 再弹"确认安装"并写明写到哪块盘
+        if ! find_target_disk; then continue; fi
         if confirm "$(zh_en '确认安装' 'Confirm install')" \
-           "$(zh_en '即将把固件写入内置硬盘, 目标盘上的所有数据都会被清空。\n\n是否继续?' \
-                      'The firmware will be written to the internal disk.\nALL DATA on the target disk will be erased.\n\nContinue?')"; then
+           "$(zh_en "即将把固件写入:\n\n  $TARGET  ($(disk_desc "$(basename "$TARGET")"))\n\n该盘上的所有数据都会被清空。\n\n是否继续?" \
+                      "The firmware will be written to:\n\n  $TARGET  ($(disk_desc "$(basename "$TARGET")"))\n\nALL DATA on that disk will be erased.\n\nContinue?")"; then
           # 关键: 安装过程既实时显示、又存一份日志, 结束后用对话框把整段日志呈现
           # 出来 —— 否则一旦出错, 那些行会被菜单重绘立刻刷掉, 用户根本看不清报的
           # 什么错(这就是"装不上但不知道原因"的来源)。
