@@ -1612,12 +1612,13 @@ Usage: openwrt-install [options] [firmware.img.gz]
   (no args)        interactive menu (recommended)
   --no-menu        skip the menu, install straight to the internal disk
   --change-ip      only change the LAN IP
-  --clone          kept for compatibility: cloning the running medium is now
-                   the default install method, with or without this flag
+  --clone          kept for compatibility: installing the running system's
+                   partitions is now the default, with or without this flag
   --force          kept for compatibility: writing the disk is always forced now
-                   (it no longer refuses just because partitions are mounted)
-  --diag           print diagnostics (disks, boot disk, candidates, clone
-                   source, tools) - run this when an install fails
+                   (it no longer refuses just because partitions are mounted;
+                    the boot disk itself is still refused)
+  --diag           print diagnostics (disks, boot disk, candidates, the
+                   partition copy plan, tools) - run this when an install fails
   --disk <dev>     target disk, e.g. --disk /dev/sdb
                    (required when several disks exist and there is no terminal;
                     OPENWRT_TARGET_DISK=/dev/sdb works too)
@@ -1653,9 +1654,9 @@ EOF
   (无参数)        显示交互式菜单 (推荐)
   --no-menu       跳过菜单, 直接安装到内置硬盘(原一键安装行为)
   --change-ip     直接进入"修改 LAN 口 IP"功能(对应 quickstart 的改 IP)
-  --clone         兼容写法: 现在"克隆安装"就是默认行为, 加不加都一样
-  --force         兼容开关: 现在默认就会直接写盘(不再因为"分区被占用"拒绝), 加不加都一样
-  --diag          打印诊断信息(磁盘/启动盘/候选判定/克隆源/工具), 装不上时先跑这个
+  --clone         兼容写法: 现在"装当前系统的分区到目标盘"就是默认行为, 加不加都一样
+  --force         兼容开关: 现在默认就会直接写盘(不再因为"分区被占用"拒绝); 启动盘仍会拒绝
+  --diag          打印诊断信息(磁盘/启动盘/候选判定/分区复制计划/工具), 装不上时先跑这个
   --disk <设备>   指定目标盘, 例如 --disk /dev/sdb
                   (多块盘且非交互环境下**必须**用它; 也接受
                    OPENWRT_TARGET_DISK=/dev/sdb 环境变量)
