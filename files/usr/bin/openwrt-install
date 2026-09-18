@@ -2,15 +2,18 @@
 # =============================================
 # openwrt-install : 一键安装 OpenWrt 到内置硬盘
 # 用法: openwrt-install [选项] [固件路径]
-#   - 默认就是"克隆安装": 把当前运行的介质(U盘)整盘复制到内置盘, 不需要镜像文件/网络
+#   - 默认就是"克隆安装": 把当前运行介质(U盘)上的**系统分区**装到内置盘,
+#     不需要镜像文件/网络。不是整盘 dd: 在目标盘上重建分区表(start/type/uuid
+#     照抄源盘, 所以 PARTUUID 不变、grub 不用改), 只把 rootfs 等系统分区的内容
+#     按原偏移复制过去 —— 于是 128G 的 U 盘也能装进 7.2G 的内置盘。
 #     (只有显式给路径时才写镜像文件: openwrt-install --fw /path/to/*.img.gz)
 #   - 自动识别内置盘并**排除启动盘与U盘**, 判断全部读 sysfs
 #     (不能用 lsblk: 固件里没有该命令, 详见下面的说明)
 #   - 多块候选盘时列出让你选; 非交互环境不会瞎猜, 必须用 --disk 指定
 #   - 界面默认中文; 终端显示不了中文时用 --en 切纯 ASCII 英文
 #     (退出菜单: 0 / Esc / "退出"按钮; 纯文本菜单还可输 q)
-#   - 写入后只读检测空间: rootfs 固定 2048 MiB 为设计目标, 剩余空间保持未分配
-#     (只读探测, 不自动修改分区表; 需要扩容时会打印具体命令)
+#   - 装完只读检测空间: 克隆安装已把 rootfs 扩到盘尾并 resize2fs;
+#     刷镜像时 rootfs 保持镜像里的 2048 MiB, 剩余空间不分配(需扩容会打印命令)
 # =============================================
 
 set -e
@@ -466,7 +469,7 @@ find_target_disk() {
 bytes_to_mib() { echo $(( ($1 + 1048575) / 1048576 )); }
 
 image_raw_size() {   # 未压缩镜像大小(字节), 非 gzip 则用文件本身大小
-  magic=$(dd if="$1" bs=1 count=2 status=none 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  magic=$(od -An -tx1 -j 0 -N 2 "$1" 2>/dev/null | tr -d ' \n')
   if [ "$magic" = "1f8b" ]; then
     # gzip 尾部 4 字节是 ISIZE(未压缩长度, 小端)
     sz=$(tail -c 4 "$1" 2>/dev/null | od -An -tu4 2>/dev/null | tr -d ' \n')
@@ -482,7 +485,7 @@ image_raw_size() {   # 未压缩镜像大小(字节), 非 gzip 则用文件本�
 # 用 dd 写出来的启动介质里**只有系统本身, 没有 .img.gz 文件**(ESP 才 16 MiB
 # 装不下 35 MB 的镜像; rootfs 是只读 squashfs 也放不下), 而刷机时机器通常
 # 根本没有网络 —— 所以"搜镜像文件 / 联网下载"这两条路都没有意义:
-# 直接把当前运行的这套系统整盘复制到目标盘就行。
+# 把当前运行的这套系统的分区复制到目标盘就行(只复制系统分区, 见 plan_clone)。
 #
 # (iStoreOS 的 quickstart "Install X86" 也是这么做的: 源码 istoreos/quickstart
 #  的 backend/cmd/backend/prompt.go 里直接 dd 自己运行的那块盘。)
@@ -490,46 +493,370 @@ image_raw_size() {   # 未压缩镜像大小(字节), 非 gzip 则用文件本�
 # 只有显式给了镜像路径(--fw /path/xxx.img.gz, 或把它作为最后一个参数)时,
 # 才走"写镜像文件"这条路。
 #
-# 拷贝长度只到"最后一个分区的末尾 + 备份 GPT", 而不是整块介质
-# (32G 的 U 盘不会傻拷 32G), 目标盘只要比这个长度大就行。
-clone_src_disk() {   # 输出当前运行介质的整盘名(如 sda)
-  d=$(first_word $BOOT_DISKS)
-  [ -n "$d" ] || d=$(find_boot_disks 2>/dev/null | awk '{print $1}')
-  [ -n "$d" ] || return 1
-  echo "$d"
-}
+# 不再整盘 dd, 而是"重建分区表 + 只复制系统分区":
+# 见下面 plan_clone / write_target_table 的说明 —— 128G 的 U 盘也能装进 7.2G 的盘。
+
 
 first_word() { set -- $1; echo "${1:-}"; }
 
-clone_src_bytes() {   # $1=源盘设备(如 /dev/sda) -> 需要复制的字节数
-  dev=$1
-  maxend=0
-  # 只在确实是 GPT 时才解析(否则偏移 1024 处是启动代码, 会算出垃圾长度)
-  sig=$(dd if="$dev" bs=1 skip=512 count=8 status=none 2>/dev/null || true)
-  if [ "$sig" = "EFI PART" ]; then
-    # 一次读出整张分区表(LBA2 起, 128 项 x 128 字节 = 16 KiB), 取所有项的
-    # 结束 LBA 最大值。注意**不能只扫前 8 项**: 真机实测出现过 128 号分区
-    # (如 /dev/sda128), 漏掉它就会少复制, 克隆出来的 GPT 会指向没有数据的区域。
-    #
-    # od -w128 => 每行正好是一个完整表项(16 个 u64), 其中第 6 个字段是结束 LBA。
-    # 不要用 -w16 自己数行: od 会用 "*" 压缩连续重复行, 行号会错位(实测踩到)。
-    # 全零的空表项即使被 "*" 压缩也不影响(它们贡献 0)。
-    maxend=$(od -An -tu8 -w128 -j 1024 -N 16384 "$dev" 2>/dev/null \
-             | awk '{ v = $6 + 0; if (v > m) m = v } END { print m + 0 }')
-  fi
-  [ -n "$maxend" ] || maxend=0
-  if [ "$maxend" -le 0 ] 2>/dev/null; then
-    # 没有 GPT(例如 MBR 布局): 退化为整盘大小
-    tot=$(disk_sectors "$dev")
-    [ -n "$tot" ] && [ "$tot" -gt 0 ] 2>/dev/null || return 1
-    echo $(( tot * 512 ))
-    return 0
-  fi
-  # 末尾再留 34 个扇区(备份 GPT)
-  echo $(( (maxend + 34) * 512 ))
+# ---------------------------------------------------------------------------
+# 分区表 与 文件系统尺寸 —— 克隆安装的真正依据
+# ---------------------------------------------------------------------------
+# 血泪教训: 不要自己拿 dd/od 去解 GPT。
+#   真机实测(128G U 盘启动): 源盘上系统只占 16MiB + 2GiB + 0.2MiB 三小块,
+#   脚本却算出"需要复制 122105 MiB"(=整盘 119.2GiB), 于是对着 7.2 GiB 的
+#   内置 eMMC 报 "Target disk is too small", 根本装不上。
+#   根因: 解析器用了 `dd ... status=none`(GNU 扩展, busybox 不支持) +
+#   自己数 GPT 表项, 一旦解析失败就"兜底"成整盘大小 —— 静默地给出个
+#   荒谬的数字, 还看不出为什么。
+# 现在: 分区表一律用 `sfdisk -d` 读(packages.list 已装 sfdisk, 它的 dump
+#       格式就是拿来喂回 sfdisk 的, 稳定);
+#       复制长度用文件系统自己的大小(ext4 超级块里的块数 / squashfs 的
+#       bytes_used), 而不是分区表里那个可能被"扩容"过的分区尺寸。
+#
+# 安装方式也由"整盘 dd"改成"重建分区表 + 只复制系统分区":
+#   目标盘上照抄源盘的 start/type/uuid( uuid 就是 PARTUUID, grub.cfg 里
+#   写的 root=PARTUUID=xxx 因此不用改), 只把 rootfs 分区扩到盘尾,
+#   再把系统分区的内容按原偏移写进去。于是 128G 的 U 盘也能装进 7.2G 的盘。
+
+# 分区表: 每行 "<分区设备> <start> <size> <type> <uuid> <名字或->"
+part_table() {
+  sfdisk -d "$1" 2>/dev/null | awk '
+    /^[^ ]*[0-9] *:/ {
+      line = $0
+      dev = line; sub(/ *:.*$/, "", dev)
+      rest = substr(line, index(line, ":") + 1)
+      start = ""; size = ""; type = ""; uuid = ""; name = ""; attrs = ""
+      while (match(rest, /[a-z-]+=/)) {
+        key = substr(rest, RSTART, RLENGTH - 1)
+        rest = substr(rest, RSTART + RLENGTH)
+        if (substr(rest, 1, 1) == "\"") {          # 名字可能含空格/逗号
+          q = index(substr(rest, 2), "\"")
+          val = substr(rest, 2, q - 1)
+          rest = substr(rest, q + 2)
+        } else {
+          c = index(rest, ",")
+          if (c == 0) { val = rest; rest = "" } else { val = substr(rest, 1, c - 1); rest = substr(rest, c + 1) }
+        }
+        gsub(/^[ \t]+|[ \t]+$/, "", val)
+        if (key == "start") start = val
+        else if (key == "size") size = val
+        else if (key == "type") type = val
+        else if (key == "uuid") uuid = val
+        else if (key == "name") name = val
+        else if (key == "attrs") attrs = val
+      }
+      if (start != "" && size != "" && start + 0 > 0)
+        printf "%s %s %s %s %s %s %s\n", dev, start, size, type, uuid, (attrs == "" ? "-" : attrs), (name == "" ? "-" : name)
+    }
+  '
 }
 
-# 算出源盘与复制长度(设定 CLONE_SRC / CLONE_BYTES), 供下面两条路径共用
+disk_label_id() { sfdisk -d "$1" 2>/dev/null | sed -n 's/^label-id: *//p' | head -1; }
+
+# sda2 / mmcblk1p2 / nvme0n1p2 / test.img128 -> 分区号
+part_suffix() { s=$1; s=${s##*[!0-9]}; echo "$s"; }
+
+# 挂载点 -> 承载它的分区设备名(如 sda2)。不是块设备(overlayfs/tmpfs)则失败。
+# 必须走 mountinfo 的 major:minor 再查 sysfs: /proc/mounts 里根分区常报成
+# /dev/root 这种别名, 拿名字匹配是匹配不上的(真机踩过)。
+mp_dev_name() {
+  mm=$(awk -v m="$1" '$5 == m { print $3; exit }' /proc/self/mountinfo 2>/dev/null)
+  [ -n "$mm" ] || return 1
+  n=$(basename "$(readlink -f "/sys/dev/block/$mm" 2>/dev/null)" 2>/dev/null) || return 1
+  case "$n" in ""|"$mm"|"/") return 1 ;; esac
+  echo "$n"
+}
+
+# 文件系统真实大小(字节)。$1=设备/文件  $2=文件系统起始字节偏移。
+#   ext4     : 超级块 0x404 的块数 * (1024 << 0x418) 的块大小
+#   squashfs : superblock 偏移 40 的 bytes_used
+# 认不出就失败(调用方退回"整个分区大小")。
+fs_bytes_at() {
+  dev=$1; off=$2
+  m=$(od -An -tx1 -j "$off" -N 4 "$dev" 2>/dev/null | tr -d ' \n')
+  if [ "$m" = "68737173" ]; then                        # "hsqs"
+    b=$(od -An -tu8 -j $(( off + 40 )) -N 8 "$dev" 2>/dev/null | tr -d ' ' | head -1)
+    if [ -n "$b" ] && [ "$b" -gt 0 ] 2>/dev/null; then echo "$b"; return 0; fi
+    return 1
+  fi
+  m2=$(od -An -tx1 -j $(( off + 1080 )) -N 2 "$dev" 2>/dev/null | tr -d ' \n')
+  [ "$m2" = "53ef" ] || return 1                        # ext4 魔数
+  blocks=$(od -An -tu4 -j $(( off + 1028 )) -N 4 "$dev" 2>/dev/null | tr -d ' ' | head -1)
+  logbs=$(od -An -tu4 -j $(( off + 1048 )) -N 4 "$dev" 2>/dev/null | tr -d ' ' | head -1)
+  [ -n "$blocks" ] && [ -n "$logbs" ] && [ "$blocks" -gt 0 ] 2>/dev/null || return 1
+  echo $(( blocks * (1024 << logbs) ))
+}
+
+# 规划克隆安装。设置:
+#   PLAN_FILE          每行 "<分区号> <start> <size> <复制字节> <type> <uuid> <名字>"
+#   CLONE_BYTES        需要写进目标盘的总字节数(各保留分区末尾的最大值)
+#   CLONE_ROOT_SUFFIX  源盘上 rootfs 的分区号
+#   CLONE_ROOT_FS      rootfs 的文件系统类型(ext4/squashfs/unknown)
+plan_clone() {
+  src=$1
+  PLAN_FILE=${PLAN_FILE:-/tmp/.openwrt_plan.$$}
+  TBL_FILE=${TBL_FILE:-/tmp/.openwrt_tbl.$$}
+  : > "$PLAN_FILE"
+  part_table "$src" > "$TBL_FILE" 2>/dev/null || true
+  if [ ! -s "$TBL_FILE" ]; then
+    log_err "$(zh_en "读不出源盘 $src 的分区表 (sfdisk -d 没有输出)" \
+                      "Cannot read the partition table of $src (sfdisk -d printed nothing)")"
+    log_warn "$(zh_en '改用镜像文件安装: openwrt-install --fw /path/to/openwrt-*.img.gz' \
+                      'Install from an image file instead: openwrt-install --fw /path/to/openwrt-*.img.gz')"
+    return 1
+  fi
+
+  # (1) 找 rootfs 分区: 先按挂载点认(/rom 是只读根, / 是根);
+  #     认不出再按文件系统魔数猜。
+  root_sfx=""
+  for m in /rom /; do
+    n=$(mp_dev_name "$m" 2>/dev/null || true)
+    [ -n "$n" ] || continue
+    sfx=$(part_suffix "$n")
+    if awk -v s="$sfx" '{ n = $1; sub(/.*[^0-9]/, "", n); if (n == s) found = 1 } END { exit !found }' "$TBL_FILE"; then
+      root_sfx=$sfx
+      break
+    fi
+  done
+  if [ -z "$root_sfx" ]; then
+    sq=""; sq_sz=0; ex=""; ex_sz=0
+    while read -r pdev pstart psize ptype puuid pattrs pname; do
+      [ -n "$pstart" ] || continue
+      fs=$(fs_type_at "$src" $(( pstart * SECTOR )) 2>/dev/null || true)
+      if [ "$fs" = "squashfs" ]; then
+        if [ "$psize" -gt "$sq_sz" ] 2>/dev/null; then sq=$(part_suffix "$pdev"); sq_sz=$psize; fi
+      elif [ "$fs" = "ext4" ]; then
+        if [ "$psize" -gt "$ex_sz" ] 2>/dev/null; then ex=$(part_suffix "$pdev"); ex_sz=$psize; fi
+      fi
+      :
+    done < "$TBL_FILE"
+    # squashfs 优先: 只有 squashfs 版才有 squashfs 分区, 而它的 overlay
+    # 分区同样是 ext4 且通常更大 —— 只看"最大 ext4"会挑错。
+    root_sfx=${sq:-$ex}
+  fi
+  if [ -z "$root_sfx" ]; then
+    log_err "$(zh_en "认不出 $src 上哪个分区是系统(rootfs)" \
+                      "Cannot tell which partition on $src holds the rootfs")"
+    return 1
+  fi
+
+  # (2) rootfs 的起始/大小 + 真实文件系统大小
+  root_start=""; root_size=""
+  CLONE_ROOT_FS=""
+  while read -r pdev pstart psize ptype puuid pattrs pname; do
+    [ "$(part_suffix "$pdev")" = "$root_sfx" ] || continue
+    root_start=$pstart; root_size=$psize
+    CLONE_ROOT_FS=$(fs_type_at "$src" $(( pstart * SECTOR )) 2>/dev/null || true)
+  done < "$TBL_FILE"
+  if [ -z "$root_start" ]; then
+    log_err "$(zh_en "源盘上找不到分区 $root_sfx" "Partition $root_sfx not found on the source disk")"
+    return 1
+  fi
+
+  # 复制长度 = 文件系统自己的大小(分区可能被扩容到整盘, 那一段根本没有数据);
+  # 读不到文件系统大小就退回整个分区。
+  part_bytes=$(( root_size * SECTOR ))
+  root_copy=$(fs_bytes_at "$src" $(( root_start * SECTOR )) 2>/dev/null || true)
+  if [ -z "$root_copy" ] || [ "$root_copy" -le 0 ] 2>/dev/null; then
+    root_copy=$part_bytes
+  fi
+  if [ "$root_copy" -gt "$part_bytes" ]; then root_copy=$part_bytes; fi
+  root_copy=$(( (root_copy + 1048575) / 1048576 * 1048576 ))   # 按 1 MiB 向上取整
+  if [ "$root_copy" -gt "$part_bytes" ]; then root_copy=$part_bytes; fi
+
+  # (3) 保留 rootfs 之前的所有分区(启动链: ESP/内核分区 + BIOS boot) 与
+  #     rootfs 本身。rootfs 之后的分区(数据盘/旧 overlay)一律不复制。
+  cl_bytes=0
+  while read -r pdev pstart psize ptype puuid pattrs pname; do
+    sfx=$(part_suffix "$pdev")
+    [ -n "$sfx" ] || continue
+    if [ "$sfx" = "$root_sfx" ]; then
+      copy=$root_copy
+    elif [ "$pstart" -lt "$root_start" ] 2>/dev/null; then
+      copy=$(( psize * SECTOR ))
+    else
+      continue
+    fi
+    printf '%s %s %s %s %s %s %s %s\n' "$sfx" "$pstart" "$psize" "$copy" "$ptype" "$puuid" "$pattrs" "$pname" >> "$PLAN_FILE"
+    end=$(( pstart * SECTOR + copy ))
+    if [ "$end" -gt "$cl_bytes" ]; then cl_bytes=$end; fi
+    :
+  done < "$TBL_FILE"
+
+  rm -f "$TBL_FILE"
+  if [ "$cl_bytes" -le 0 ] 2>/dev/null; then
+    log_err "$(zh_en '算不出要复制的内容' 'Could not work out what to copy')"
+    return 1
+  fi
+  CLONE_ROOT_SUFFIX=$root_sfx
+  CLONE_ROOT_START=$root_start
+  CLONE_BYTES=$cl_bytes
+  return 0
+}
+
+# 克隆计划的人话版本(装不上时靠它看清到底在拷什么)
+clone_plan_report() {
+  [ -s "$PLAN_FILE" ] || return 0
+  log_info "$(zh_en "源盘 $CLONE_SRC_PATH 上参与安装的分区:" "Partitions of $CLONE_SRC_PATH that take part:")"
+  while read -r sfx st sz cp ty uu at pn; do
+    [ -n "$st" ] || continue
+    log_info "$(zh_en "  分区 $sfx: 偏移 $(bytes_to_mib $(( st * SECTOR ))) MiB, 复制 $(bytes_to_mib "$cp") MiB (分区 $(( sz / 2048 )) MiB)" \
+                      "  part $sfx: offset $(bytes_to_mib $(( st * SECTOR ))) MiB, copy $(bytes_to_mib "$cp") MiB (partition $(( sz / 2048 )) MiB)")"
+    :
+  done < "$PLAN_FILE"
+  log_info "$(zh_en "合计需要写入: $(bytes_to_mib "$CLONE_BYTES") MiB (rootfs 文件系统类型: ${CLONE_ROOT_FS:-未知})" \
+                    "Total to write: $(bytes_to_mib "$CLONE_BYTES") MiB (rootfs filesystem: ${CLONE_ROOT_FS:-unknown})")"
+}
+
+# 把 $1 上从第 $3 扇区起的 $4 字节写到 $2 的同一偏移。
+# 用 256 KiB 块(官方镜像布局就是 256 KiB 对齐的), 不对齐时退回 512 字节块。
+copy_range() {
+  src=$1; dst=$2; st=$3; len=$4
+  [ -n "$len" ] && [ "$len" -gt 0 ] 2>/dev/null || return 0
+  if [ $(( st % 512 )) -eq 0 ] && [ $(( len % 262144 )) -eq 0 ]; then
+    sk=$(( st / 512 )); n=$(( len / 262144 ))
+    dd if="$src" of="$dst" bs=256K skip="$sk" seek="$sk" count="$n" conv=notrunc,fsync
+  else
+    n=$(( (len + 511) / 512 ))
+    dd if="$src" of="$dst" bs=512 skip="$st" seek="$st" count="$n" conv=notrunc,fsync
+  fi
+}
+
+# 按计划逐分区复制(不整盘拷: 128G 的 U 盘只有 2G 多需要写)
+copy_plan() {
+  src=$1; dst=$2
+  while read -r sfx st sz cp ty uu at pn; do
+    [ -n "$st" ] || continue
+    log_info "$(zh_en "复制分区 $sfx: $(bytes_to_mib "$cp") MiB -> 偏移 $(bytes_to_mib $(( st * SECTOR ))) MiB" \
+                      "copying partition $sfx: $(bytes_to_mib "$cp") MiB at offset $(bytes_to_mib $(( st * SECTOR ))) MiB")"
+    copy_range "$src" "$dst" "$st" "$cp" || return 1
+  done < "$PLAN_FILE"
+  return 0
+}
+
+# 目标盘的分区名(带 p 与否): mmcblk1 -> mmcblk1p2, sda -> sda2
+target_part_dev() {
+  name=$(basename "$TARGET")
+  case "$name" in *[0-9]) echo "/dev/${name}p$1" ;; *) echo "/dev/${name}$1" ;; esac
+}
+
+# 在目标盘上重建分区表。
+#   start/type/uuid 全部照抄源盘 —— uuid 就是内核里的 PARTUUID, grub.cfg 写的
+#   是 root=PARTUUID=xxx, 抄下来才知道该从哪启动(不用改任何引导配置)。
+#   目标盘更大的话: ext4 版把 rootfs 扩到盘尾(随后 resize2fs 扩文件系统);
+#   squashfs 版 rootfs 只读, 保持原大小, 剩余空间不分配(与刷镜像的行为一致)。
+write_target_table() {
+  tgt=$1
+  tsec=$(disk_sectors "$tgt")
+  if [ -z "$tsec" ] || [ "$tsec" -le 0 ] 2>/dev/null; then
+    log_err "$(zh_en "读不出目标盘 $tgt 的容量" "Cannot read the size of $tgt")"
+    return 1
+  fi
+  tlast=$(( tsec - 34 ))          # 盘尾留给备份 GPT(33 个扇区)
+  tname=$(basename "$tgt")
+  case "$tname" in *[0-9]) tsep=p ;; *) tsep="" ;; esac
+  lid=$(disk_label_id "$CLONE_SRC_PATH" 2>/dev/null || true)
+
+  # 先算最终尺寸并检查放得下(sfdisk 遇到越界会直接拒绝, 不如自己先报清楚)
+  TABLE_FILE=${TABLE_FILE:-/tmp/.openwrt_tbl2.$$}
+  : > "$TABLE_FILE"
+  while read -r sfx st sz cp ty uu at pn; do
+    [ -n "$st" ] || continue
+    fit=$(( tlast - st + 1 ))
+    need=$(( (cp + SECTOR - 1) / SECTOR ))          # 至少要放得下要复制的内容
+    if [ "$sfx" = "$CLONE_ROOT_SUFFIX" ] && [ "$CLONE_ROOT_FS" = "ext4" ]; then
+      newsz=$fit                                    # ext4 版: 扩到盘尾, 随后 resize2fs
+    elif [ "$sz" -gt "$fit" ] 2>/dev/null; then
+      newsz=$fit                                    # 源分区被扩得比目标盘还大: 收缩到放得下
+    else
+      newsz=$sz
+    fi
+    if [ "$newsz" -lt "$need" ] 2>/dev/null; then
+      log_err "$(zh_en "分区 $sfx 放不下: 需要 $(bytes_to_mib $(( need * SECTOR ))) MiB, 只有 $(bytes_to_mib $(( fit * SECTOR ))) MiB 可用" \
+                        "Partition $sfx does not fit: needs $(bytes_to_mib $(( need * SECTOR ))) MiB, only $(bytes_to_mib $(( fit * SECTOR ))) MiB available")"
+      return 1
+    fi
+    printf '%s %s %s %s %s %s %s\n' "$sfx" "$st" "$newsz" "$ty" "$uu" "$at" "$pn" >> "$TABLE_FILE"
+    :
+  done < "$PLAN_FILE"
+
+  script="label: gpt
+"
+  if [ -n "$lid" ]; then script="${script}label-id: $lid
+"; fi
+  script="${script}unit: sectors
+first-lba: 34
+last-lba: $tlast
+"
+  while read -r sfx st newsz ty uu at pn; do
+    [ -n "$st" ] || continue
+    line="${tname}${tsep}${sfx} : start=${st}, size=${newsz}, type=${ty}, uuid=${uu}"
+    if [ -n "$at" ] && [ "$at" != "-" ]; then
+      line="${line}, attrs=\"${at}\""
+    fi
+    if [ -n "$pn" ] && [ "$pn" != "-" ]; then
+      line="${line}, name=\"${pn}\""
+    fi
+    script="${script}${line}
+"
+    :
+  done < "$TABLE_FILE"
+  rm -f "$TABLE_FILE"
+
+  log_info "$(zh_en "写入 $tgt 的分区表 (start/uuid 与源盘一致, PARTUUID 不变)..." \
+                    "Writing the partition table of $tgt (same start/uuid as the source, PARTUUID unchanged)...")"
+  if ! printf '%s' "$script" | sfdisk --force "$tgt"; then
+    log_err "$(zh_en 'sfdisk 写分区表失败' 'sfdisk failed to write the partition table')"
+    return 1
+  fi
+  sync
+  return 0
+}
+
+# 装完之后: ext4 版的 rootfs 分区已被扩到盘尾, 这里把文件系统也扩上去。
+# 复制自"正在运行"的文件系统, 先 e2fsck -f -y 修一遍(重放日志)再 resize2fs。
+grow_target_rootfs() {
+  [ "$CLONE_ROOT_FS" = "ext4" ] || return 0
+  pdev=$(target_part_dev "$CLONE_ROOT_SUFFIX")
+  command -v e2fsck    >/dev/null 2>&1 || { log_warn "$(zh_en '固件里没有 e2fsck, 跳过扩容' 'e2fsck not in firmware, skipping resize')"; return 0; }
+  command -v resize2fs >/dev/null 2>&1 || { log_warn "$(zh_en '固件里没有 resize2fs, 跳过扩容' 'resize2fs not in firmware, skipping resize')"; return 0; }
+  partx -u "$TARGET" >/dev/null 2>&1 || true
+  sleep 1
+  if [ ! -b "$pdev" ]; then
+    log_warn "$(zh_en "内核还没生成 $pdev, 跳过扩容(重启后手动: e2fsck -fy $pdev; resize2fs $pdev)" \
+                      "kernel has not created $pdev yet, skipping resize (after reboot: e2fsck -fy $pdev; resize2fs $pdev)")"
+    return 0
+  fi
+  # 内核必须已经按新表重建了这个分区。设备忙的时候 sfdisk 重读分区表会被内核
+  # 拒绝, 那样 /dev/mmcblk1p2 还指向**旧分区范围**, 再跑 e2fsck/resize2fs 就是在
+  # 改别的文件系统了 —— 所以先比对 sysfs 里的实际扇区数, 不符就放弃扩容。
+  tsec=$(disk_sectors "$TARGET")
+  pexpect=$(( tsec - 34 - CLONE_ROOT_START + 1 ))
+  pact=$(cat "/sys/class/block/$(basename "$pdev")/size" 2>/dev/null | tr -d ' ' || true)
+  if [ -n "$pact" ] && [ "$pact" != "$pexpect" ]; then
+    log_warn "$(zh_en "$pdev 还是旧尺寸($pact 扇区, 应为 $pexpect): 内核没重读分区表, 跳过扩容; 重启后执行 e2fsck -fy $pdev && resize2fs $pdev" \
+                      "$pdev still has the old size ($pact sectors, expected $pexpect): the kernel did not re-read the table, skipping resize; after reboot run e2fsck -fy $pdev && resize2fs $pdev")"
+    return 0
+  fi
+  log_info "$(zh_en "检查并扩容目标盘文件系统: $pdev" "Checking and growing the target filesystem: $pdev")"
+  rc=0
+  e2fsck -f -y "$pdev" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -ge 4 ] 2>/dev/null; then
+    log_warn "$(zh_en "e2fsck 报错(返回码 $rc), 不扩容了; 系统仍可启动, 重启后可手动 resize2fs $pdev" \
+                      "e2fsck reported errors (rc $rc); not resizing. The system can still boot; run resize2fs $pdev after reboot")"
+    return 0
+  fi
+  if resize2fs "$pdev" >/dev/null 2>&1; then
+    log_info "$(zh_en "文件系统已扩到分区大小: $pdev" "Filesystem grown to the partition size: $pdev")"
+  else
+    log_warn "$(zh_en "resize2fs 失败, rootfs 仍是原大小(系统可正常启动); 重启后可手动执行 resize2fs $pdev" \
+                      "resize2fs failed, rootfs keeps its size (the system still boots); run resize2fs $pdev after reboot")"
+  fi
+  return 0
+}
+
+# 算出源盘与复制内容(设定 CLONE_SRC / CLONE_BYTES / 计划), 供下面共用
 clone_resolve() {
   s=$(clone_src_disk) || {
     log_err "$(zh_en '认不出当前运行的介质(启动盘), 没法克隆' \
@@ -540,25 +867,21 @@ clone_resolve() {
   }
   s=$(disk_of_part "/dev/$s")   # 归一: 万一拿到的是分区名, 换成它所在的整盘
   if [ "$s" = "$(basename "$TARGET")" ]; then
-    log_err "$(zh_en '源盘和目标盘是同一块($s), 拒绝' "Source and target are the same disk ($s) - refusing")"
+    log_err "$(zh_en "源盘和目标盘是同一块($s), 拒绝" "Source and target are the same disk ($s) - refusing")"
     return 1
   fi
-  b=$(clone_src_bytes "${CLONE_SRC_PATH_OVERRIDE:-/dev/$s}") || {
-    log_err "$(zh_en '读不出源盘分区表, 无法确定复制长度' 'Cannot read the source partition table')"
-    return 1
-  }
   CLONE_SRC=$s
   CLONE_SRC_PATH=${CLONE_SRC_PATH_OVERRIDE:-/dev/$s}
-  CLONE_BYTES=$b
+  plan_clone "$CLONE_SRC_PATH" || return 1
   return 0
 }
 
-# 准备克隆(现在是唯一的安装路径): 算出源盘与复制长度并置位
+# 准备克隆(现在是唯一的安装路径): 算出计划并置位
 clone_prepare() {
   clone_resolve || return 1
   CLONE=1
-  log_info "$(zh_en "离线克隆: $CLONE_SRC_PATH -> $TARGET (复制 $(bytes_to_mib "$CLONE_BYTES") MiB)" \
-                    "Offline clone: $CLONE_SRC_PATH -> $TARGET (copying $(bytes_to_mib "$CLONE_BYTES") MiB)")"
+  log_info "$(zh_en "克隆安装: $CLONE_SRC_PATH -> $TARGET" "Clone install: $CLONE_SRC_PATH -> $TARGET")"
+  clone_plan_report
   return 0
 }
 
@@ -594,8 +917,8 @@ check_target_size() {
 countdown() {
   # 这条警告是最关键的安全提示, 英文界面下也必须看得懂
   if [ "$CLONE" = "1" ]; then
-    log_warn "$(zh_en "5秒后把 $CLONE_SRC_PATH 整盘克隆到 $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
-                      "Cloning $CLONE_SRC_PATH to $TARGET  ($(disk_desc "$(basename "$TARGET")")) in 5 seconds")"
+    log_warn "$(zh_en "5秒后把 $CLONE_SRC_PATH 的系统分区装到 $TARGET (重建分区表 + 复制 $(bytes_to_mib "$CLONE_BYTES") MiB)  ($(disk_desc "$(basename "$TARGET")"))" \
+                      "Installing the system partitions of $CLONE_SRC_PATH to $TARGET (new partition table + $(bytes_to_mib "$CLONE_BYTES") MiB copy)  ($(disk_desc "$(basename "$TARGET")")) in 5 seconds")"
   else
     log_warn "$(zh_en "5秒后将把 $FW 写入 $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
                       "Writing $FW to $TARGET  ($(disk_desc "$(basename "$TARGET")")) in 5 seconds")"
@@ -621,23 +944,15 @@ countdown() {
 # 探测全部基于 BusyBox 自带工具(dd/od/grep), 不依赖已不在固件中的 lsblk/blkid。
 
 SECTOR=512
-# rootfs 分区的目标尺寸(MiB)。本固件镜像内 rootfs 已是该尺寸;
-# 脚本不会把 rootfs 扩满整盘, 磁盘剩余空间保持未分配。
+# rootfs 分区的目标尺寸(MiB)。刷镜像(--fw)时镜像内 rootfs 就是这个尺寸,
+# 剩余空间保持未分配; 克隆安装则会把 rootfs 扩满整盘(见 write_target_table)。
 ROOT_PART_TARGET_MIB=2048
 
-# 从磁盘读一个小端 u64 (status=none 必须加: busybox dd 默认把统计打到 stdout)
+# 从磁盘读一个小端 u64。
+# 用 od -j 直接按偏移读, 不再套 dd: busybox 的 dd 不认 GNU 的 `status=none`,
+# 一报错就静默返回空值 —— 真机上"整盘 122105 MiB"那个数字就是这么来的。
 le_u64() {
-  dd if="$1" bs=1 skip="$2" count=8 status=none 2>/dev/null | od -An -tu8 | tr -d ' \n'
-}
-
-# -> "start end" (扇区), 无此分区则输出空
-gpt_part_range() {
-  dev="$1"; idx="$2"
-  base=$(( 512 + 512 + (idx - 1) * 128 ))
-  s=$(le_u64 "$dev" $(( base + 32 )))
-  e=$(le_u64 "$dev" $(( base + 40 )))
-  [ -n "$s" ] && [ -n "$e" ] && [ "$s" -gt 0 ] 2>/dev/null && [ "$e" -ge "$s" ] 2>/dev/null \
-    && printf '%s %s' "$s" "$e"
+  od -An -tu8 -j "$2" -N 8 "$1" 2>/dev/null | tr -d ' ' | head -1
 }
 
 disk_sectors() {
@@ -664,11 +979,12 @@ disk_lba_max() {
   echo $(( total - 34 ))
 }
 
-# 按魔数识别文件系统: squashfs('hsqs') / ext4(superblock 0x53ef)
+# 按魔数识别文件系统: squashfs('hsqs') / ext4(超级块魔数 0x53ef)。
+# 一律用 od -j 按偏移读, 不用 dd(same reason as le_u64)。
 fs_type_at() {
-  m=$(dd if="$1" bs=1 skip="$2" count=4 status=none 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  m=$(od -An -tx1 -j "$2" -N 4 "$1" 2>/dev/null | tr -d ' \n')
   case "$m" in 68737173) echo squashfs; return ;; esac
-  m2=$(dd if="$1" bs=1 skip=$(( $2 + 1080 )) count=2 status=none 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  m2=$(od -An -tx1 -j $(( $2 + 1080 )) -N 2 "$1" 2>/dev/null | tr -d ' \n')
   case "$m2" in 53ef) echo ext4; return ;; esac
   echo "unknown"
 }
@@ -676,29 +992,31 @@ fs_type_at() {
 # 扇区 -> MiB, 四舍五入, 与 resize2fs/df 报告的数值保持一致
 sectors_to_mib() { echo $(( ($1 + 1024) / 2048 )); }
 
-# 找到实际承载系统的分区: 优先匹配 ext4/squashfs 魔数, 退化为最大分区
+# 找到承载系统的分区(装完给空间报告用): 优先 ext4/squashfs 魔数, 退化为最大分区。
+# 表来源与分析克隆时同一套: sfdisk -d, 不再自己解析 GPT。
 find_rootfs_partition() {
   dev="$1"
   BEST_IDX=""; BEST_START=""; BEST_SIZE=""; BEST_FS=""
-  for idx in 1 2 3 4 5 6 7 8; do
-    # 注意 || true: set -e 下 "赋值+命令替换" 若命令失败会直接退出脚本 ——
-    # 分区数少于 8 个时 gpt_part_range 返回非 0, 不加这个守卫整个程序就断了。
-    r=$(gpt_part_range "$dev" "$idx" || true)
-    [ -n "$r" ] || continue
-    s=${r% *}; e=${r#* }
-    sz=$(( e - s + 1 ))
-    fs=$(fs_type_at "$dev" $(( s * SECTOR )))
+  TBL=${TBL_FILE:-/tmp/.openwrt_tbl.$$}
+  part_table "$dev" > "$TBL" 2>/dev/null || true
+  [ -s "$TBL" ] || return 0
+  while read -r pdev pstart psize ptype puuid pattrs pname; do
+    [ -n "$pstart" ] || continue
+    idx=$(part_suffix "$pdev")
+    fs=$(fs_type_at "$dev" $(( pstart * SECTOR )) 2>/dev/null || true)
     case "$fs" in
       ext4|squashfs)
-        if [ -z "$BEST_FS" ] || [ "$sz" -gt "$BEST_SIZE" ] 2>/dev/null; then
-          BEST_IDX=$idx; BEST_START=$s; BEST_SIZE=$sz; BEST_FS=$fs
+        if [ -z "$BEST_FS" ] || [ "$psize" -gt "$BEST_SIZE" ] 2>/dev/null; then
+          BEST_IDX=$idx; BEST_START=$pstart; BEST_SIZE=$psize; BEST_FS=$fs
         fi ;;
       *)
-        if [ -z "$BEST_FS" ] && { [ -z "$BEST_SIZE" ] || [ "$sz" -gt "$BEST_SIZE" ] 2>/dev/null; }; then
-          BEST_IDX=$idx; BEST_START=$s; BEST_SIZE=$sz; BEST_FS=$fs
+        if [ -z "$BEST_FS" ] && { [ -z "$BEST_SIZE" ] || [ "$psize" -gt "$BEST_SIZE" ] 2>/dev/null; }; then
+          BEST_IDX=$idx; BEST_START=$pstart; BEST_SIZE=$psize; BEST_FS=$fs
         fi ;;
     esac
-  done
+    :
+  done < "$TBL"
+  rm -f "$TBL"
 }
 
 post_install_space_report() {
@@ -794,10 +1112,19 @@ EOF
 EOF
     fi
   else
-    log_info "$(zh_en "rootfs 分区 $(sectors_to_mib "$BEST_SIZE") MiB (已达目标 ${ROOT_PART_TARGET_MIB} MiB) ✅" \
-                      "rootfs partition $(sectors_to_mib "$BEST_SIZE") MiB (target ${ROOT_PART_TARGET_MIB} MiB reached) OK")"
-    log_info "$(zh_en '剩余空间保持未分配, 未创建数据分区(本固件的约定)' \
-                      'Remaining space is left unallocated; no data partition is created (by design)')"
+    root_end=$(( BEST_START + BEST_SIZE - 1 ))
+    if [ "$root_end" -ge "$(( fsmax - 2048 ))" ] 2>/dev/null; then
+      # 克隆安装走的这条路: write_target_table 已把 rootfs 扩到盘尾, 这里只是确认。
+      log_info "$(zh_en "rootfs 分区 $(sectors_to_mib "$BEST_SIZE") MiB —— 已占满整盘 ✅" \
+                        "rootfs partition $(sectors_to_mib "$BEST_SIZE") MiB - fills the whole disk OK")"
+      log_info "$(zh_en '克隆安装已自动扩到盘尾, 不需要再手动扩容。' \
+                        'The clone install grew it automatically; no manual resizing needed.')"
+    else
+      log_info "$(zh_en "rootfs 分区 $(sectors_to_mib "$BEST_SIZE") MiB (镜像设计的 ${ROOT_PART_TARGET_MIB} MiB) ✅" \
+                        "rootfs partition $(sectors_to_mib "$BEST_SIZE") MiB (the image default ${ROOT_PART_TARGET_MIB} MiB) OK")"
+      log_info "$(zh_en '剩余空间保持未分配, 未创建数据分区(刷镜像时的约定)' \
+                        'Remaining space is left unallocated; no data partition is created (image-write default)')"
+    fi
   fi
 
   if [ -n "$missing" ]; then
@@ -1068,14 +1395,22 @@ show_diag() {
   echo "-- $(zh_en '克隆安装的源盘' 'clone install source') --"
   cs=$(clone_src_disk 2>/dev/null || true)
   if [ -n "$cs" ]; then
-    cb=$(clone_src_bytes "/dev/$cs" 2>/dev/null || true)
-    echo "  $(zh_en '源盘' 'source'): /dev/$cs   $(zh_en '需要复制' 'copy') ${cb:-?} $(zh_en '字节' 'bytes')"
+    cs=$(disk_of_part "/dev/$cs")
+    echo "  $(zh_en '源盘' 'source'): /dev/$cs"
+    echo "  $(zh_en '源盘分区表(sfdisk -d)' 'source partitions (sfdisk -d)') --"
+    part_table "/dev/$cs" 2>/dev/null | sed 's/^/    /'
+    if plan_clone "/dev/$cs" 2>/dev/null; then
+      clone_plan_report
+      rm -f "$PLAN_FILE"
+    else
+      echo "    $(zh_en '规划失败: 见上面的报错' 'planning failed: see the error above')"
+    fi
   else
     echo "  $(zh_en '认不出当前启动介质, 无法克隆安装' 'cannot identify the running medium, clone install unavailable')"
   fi
   echo
   echo "-- $(zh_en '工具' 'tools') --"
-  for t in whiptail sfdisk resize2fs e2fsck gunzip dd mount umount partx mkfs.ext4; do
+  for t in whiptail sfdisk resize2fs e2fsck gunzip dd mount umount partx mkfs.ext4 od awk; do
     printf '  %-11s %s\n' "$t" "$(command -v $t 2>/dev/null || echo MISSING)"
   done
   echo
@@ -1223,9 +1558,14 @@ do_install() {
   countdown
 
   if [ "$CLONE" = "1" ]; then
-    log_info "$(zh_en "正在克隆 $CLONE_SRC_PATH -> $TARGET ..." "Cloning $CLONE_SRC_PATH -> $TARGET ...")"
-    # 只复制到最后一个分区末尾(含备份 GPT), 不整盘拷贝 —— 32G 的 U 盘不会傻copy 32G
-    dd if="$CLONE_SRC_PATH" of="$TARGET" bs=4M count="$(( CLONE_BYTES / 4194304 + 1 ))" conv=fsync
+    # 不是整盘 dd! 只把系统分区的内容按原偏移写进去, 分区表随后重建 ——
+    # 这样 128G 的 U 盘(系统只占 2G 多)也能装进 7.2G 的内置盘。
+    log_info "$(zh_en "正在复制系统分区 $CLONE_SRC_PATH -> $TARGET ..." \
+                      "Copying the system partitions $CLONE_SRC_PATH -> $TARGET ...")"
+    copy_plan "$CLONE_SRC_PATH" "$TARGET" || return 1
+    write_target_table "$TARGET" || return 1
+    sync
+    grow_target_rootfs || true
   elif command -v gunzip >/dev/null 2>&1; then
     log_info "$(zh_en '解压并写入镜像...' 'Decompressing and writing the image...')"
     gunzip -c "$FW" | dd of="$TARGET" bs=4M conv=fsync
@@ -1235,8 +1575,9 @@ do_install() {
   fi
   sync
 
-  # 只读探测 (不自动改分区表)
+  # 只读探测 (不自动改分区表; 克隆安装时 rootfs 已在上面扩过)
   post_install_space_report "$TARGET" || true
+  rm -f "$PLAN_FILE" "$TABLE_FILE" 2>/dev/null || true
 
   log_info "$(zh_en '安装完成! 请拔掉U盘重启, 首次启动约需2-3分钟.' \
                     'Done! Unplug the USB stick and reboot; first boot takes 2-3 minutes.')"
