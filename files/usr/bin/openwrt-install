@@ -134,10 +134,44 @@ list_disks() {
     d=$(basename "$p")
     if [ -e "$p/partition" ]; then continue; fi
     if [ ! -e "$p/device" ]; then continue; fi
-    case "$d" in loop*|ram*|zram*|dm-*|md*|sr*|fd*|nbd*) continue ;; esac
+    # mmcblk*boot0/*boot1/*rpmb 是 eMMC 的硬件 boot/RPMB 区(通常 4 MiB),
+    # 不是可用磁盘 —— 真机上它们曾被当成候选盘列出来
+    case "$d" in
+      loop*|ram*|zram*|dm-*|md*|sr*|fd*|nbd*) continue ;;
+      *boot0|*boot1|*rpmb) continue ;;
+    esac
     if [ ! -b "/dev/$d" ]; then continue; fi
     printf '%s\n' "$d"
   done
+}
+
+# 某个挂载点背后真正的块设备(整盘名, 如 sda)。
+#
+# 为什么不能只看 /proc/mounts 里的设备名: 内核在那种表里可能把根设备写成
+# **别名** /dev/root(真机实测: Wyse 3040 上 / 与 /rom 都是 "/dev/root"),
+# 按名字解析只会得到垃圾("root"), 于是启动盘识别失败、克隆源也算不出来。
+# 这里改用 /proc/self/mountinfo 的 major:minor 去 /sys/dev/block 反查真实设备名。
+mountpoint_disk() {   # $1=挂载点 -> 输出整盘名; 失败返回 1
+  mp=$1
+  majmin=$(awk -v m="$mp" '$5 == m {print $3; exit}' /proc/self/mountinfo 2>/dev/null || true)
+  if [ -n "$majmin" ]; then
+    real=$(readlink -f "/sys/dev/block/$majmin" 2>/dev/null || true)
+    case "$real" in
+      */block/*)
+        n=$(basename "$real")
+        disk_of_part "/dev/$n"
+        return 0 ;;
+    esac
+  fi
+  # 退路: /proc/mounts 的设备名(可能带 /dev/root 这类别名, 先 readlink 解一下)
+  s=$(awk -v m="$mp" '$2 == m {print $1; exit}' /proc/mounts 2>/dev/null || true)
+  case "$s" in
+    /dev/*)
+      s=$(readlink -f "$s" 2>/dev/null || echo "$s")
+      disk_of_part "$s"
+      return 0 ;;
+  esac
+  return 1
 }
 
 # 启动盘: OpenWrt 里 /rom 是真实根文件系统所在(overlay 的 / 不行),
@@ -149,6 +183,15 @@ list_disks() {
 # 于是真机上"启动盘识别失败", 正在运行的系统盘会被当成可写候选盘(危险)。
 find_boot_src() {
   BOOT_SRC=""
+  # 先走 sysfs 反查(能正确处理 /dev/root 这类别名), 并顺便拿到整盘
+  for mp in /rom / /boot; do
+    d=$(mountpoint_disk "$mp" 2>/dev/null || true)
+    if [ -n "$d" ]; then
+      echo "/dev/$d"
+      return 0
+    fi
+  done
+  # 退路: 直接读设备名(解别名), 再退到内核 root=
   for mp in /rom /; do
     s=$(awk -v m="$mp" '$2 == m {print $1; exit}' /proc/mounts 2>/dev/null || true)
     if [ -z "$s" ]; then
@@ -157,7 +200,11 @@ find_boot_src() {
     if [ -z "$s" ]; then
       s=$(findmnt -no SOURCE "$mp" 2>/dev/null || true)
     fi
-    case "$s" in /dev/*) BOOT_SRC=$s; break ;; esac
+    case "$s" in
+      /dev/*)
+        s=$(readlink -f "$s" 2>/dev/null || echo "$s")
+        BOOT_SRC=$s; break ;;
+    esac
   done
   if [ -z "$BOOT_SRC" ]; then
     r=$(sed -n 's/.*[[:space:]]root=\([^[:space:]]*\).*/\1/p' /proc/cmdline 2>/dev/null || true)
@@ -457,13 +504,20 @@ first_word() { set -- $1; echo "${1:-}"; }
 clone_src_bytes() {   # $1=源盘设备(如 /dev/sda) -> 需要复制的字节数
   dev=$1
   maxend=0
-  for idx in 1 2 3 4 5 6 7 8; do
-    # 同上: 必须 || true, 否则分区数不足 8 个时 set -e 会直接退出
-    r=$(gpt_part_range "$dev" "$idx" || true)
-    [ -n "$r" ] || continue
-    e=${r#* }
-    [ "$e" -gt "$maxend" ] 2>/dev/null && maxend=$e
-  done
+  # 只在确实是 GPT 时才解析(否则偏移 1024 处是启动代码, 会算出垃圾长度)
+  sig=$(dd if="$dev" bs=1 skip=512 count=8 status=none 2>/dev/null || true)
+  if [ "$sig" = "EFI PART" ]; then
+    # 一次读出整张分区表(LBA2 起, 128 项 x 128 字节 = 16 KiB), 取所有项的
+    # 结束 LBA 最大值。注意**不能只扫前 8 项**: 真机实测出现过 128 号分区
+    # (如 /dev/sda128), 漏掉它就会少复制, 克隆出来的 GPT 会指向没有数据的区域。
+    #
+    # od -w128 => 每行正好是一个完整表项(16 个 u64), 其中第 6 个字段是结束 LBA。
+    # 不要用 -w16 自己数行: od 会用 "*" 压缩连续重复行, 行号会错位(实测踩到)。
+    # 全零的空表项即使被 "*" 压缩也不影响(它们贡献 0)。
+    maxend=$(od -An -tu8 -w128 -j 1024 -N 16384 "$dev" 2>/dev/null \
+             | awk '{ v = $6 + 0; if (v > m) m = v } END { print m + 0 }')
+  fi
+  [ -n "$maxend" ] || maxend=0
   if [ "$maxend" -le 0 ] 2>/dev/null; then
     # 没有 GPT(例如 MBR 布局): 退化为整盘大小
     tot=$(disk_sectors "$dev")
@@ -484,6 +538,7 @@ clone_resolve() {
                       'Use an image file instead: openwrt-install --fw /path/to/openwrt-*.img.gz')"
     return 1
   }
+  s=$(disk_of_part "/dev/$s")   # 归一: 万一拿到的是分区名, 换成它所在的整盘
   if [ "$s" = "$(basename "$TARGET")" ]; then
     log_err "$(zh_en '源盘和目标盘是同一块($s), 拒绝' "Source and target are the same disk ($s) - refusing")"
     return 1
@@ -982,7 +1037,7 @@ show_diag() {
   for d in $(list_disks); do echo "  /dev/$d  ($(disk_desc "$d"))"; done
   echo
   echo "-- $(zh_en '启动盘解析' 'boot disk resolution') --"
-  echo "  src  = $(find_boot_src 2>/dev/null || zh_en '(未识别)' '(unidentified)')"
+  echo "  src  = $(find_boot_src 2>/dev/null || zh_en '(未识别)' '(unidentified)')   (via /rom|/, /boot; /dev/root 之类别名已由 sysfs 反查)"
   echo "  disk = ${BOOT_DISKS:-$(find_boot_disks 2>/dev/null || zh_en '(未识别)' '(unidentified)')}"
   for d in $(list_disks); do
     mm=$(disk_mounts "$d" || true)
