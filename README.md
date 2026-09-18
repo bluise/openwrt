@@ -152,10 +152,19 @@ openwrt-install --en     # 或 OPENWRT_UI=en openwrt-install
 
 两个最常见的失败原因：
 
-1. **找不到固件**：`openwrt-*-combined-efi.img.gz` 没放在设备上。默认会搜
+1. **找不到固件**：`openwrt-*-combined-efi.img.gz` 没放在设备上。
+   安装器只负责"把某个镜像文件写到某块盘"，**它里面不含固件**。它会按顺序找：
    `/mnt` `/media` `/boot` `/mnt/usb` `/root` `/home` `/tmp` `/var/tmp` `/opt`
-   和当前目录，也会尝试自动挂载 USB 分区；找不到时如果有终端会**直接问你要路径**。
-   也可以显式给：`openwrt-install --no-menu --fw /root/xxx.img.gz`
+   和当前目录，还会尝试自动挂载 USB 分区。
+
+   都找不到时（有终端的情况下）它会**一步步带你解决**，而不是丢一句错误：
+   - 先把整个系统扫一遍（`*.img.gz` / `*.img`），用可滚动的框列出候选，
+     你可以**输编号**挑，或直接**输完整路径**、甚至**输一个目录**（会在里面找）
+   - 还是没有？直接问你要不要**从 GitHub 下载**（自动按 `/etc/openwrt_release`
+     的版本拼出正确文件名，ext4 还是 squashfs 由你选；需要设备能联网，存到 `/tmp`）
+   - 非交互场景（`--no-menu`）不提问，只打印可照抄的命令并返回菜单
+
+   任何时候也可以显式指定：`openwrt-install --no-menu --fw /root/xxx.img.gz`
    （`--fw` 与"把路径作为最后一个参数"等价）
 2. **只有一块盘、而它正是当前启动盘**：脚本会**拒绝**写它（避免把正在运行的
    系统就地清空）。要么从 U 盘启动后再装，要么用 `sysupgrade` 升级。
