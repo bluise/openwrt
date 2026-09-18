@@ -152,10 +152,18 @@ openwrt-install --en     # 或 OPENWRT_UI=en openwrt-install
 
 两个最常见的失败原因：
 
-1. **找不到固件**：`openwrt-*-combined-efi.img.gz` 没放在设备上。把它放到 U 盘
-   （或任意可读路径），或直接指定：`openwrt-install --no-menu /path/to/xxx.img.gz`
+1. **找不到固件**：`openwrt-*-combined-efi.img.gz` 没放在设备上。默认会搜
+   `/mnt` `/media` `/boot` `/mnt/usb` `/root` `/home` `/tmp` `/var/tmp` `/opt`
+   和当前目录，也会尝试自动挂载 USB 分区；找不到时如果有终端会**直接问你要路径**。
+   也可以显式给：`openwrt-install --no-menu --fw /root/xxx.img.gz`
+   （`--fw` 与"把路径作为最后一个参数"等价）
 2. **只有一块盘、而它正是当前启动盘**：脚本会**拒绝**写它（避免把正在运行的
    系统就地清空）。要么从 U 盘启动后再装，要么用 `sysupgrade` 升级。
+
+**目标盘要够大**：镜像解压后是 **2064 MiB**，所以目标盘至少 2.2 GB（VirtualBox 里
+挂个 "2 GB" 的虚拟盘是 2048 MB，**正好写不下**——建议直接给 4 GB）。
+写入前脚本会预检容量，不足时明确告诉你"需要 X MiB，而 /dev/sdX 只有 Y MiB"，
+不会再让你对着 `dd: No space left on device` 猜。
 
 选 `1` 安装，脚本会：
 1. 自动识别**可写入的硬盘**：排除当前启动盘与所有 USB 设备（判据直接读 sysfs，
@@ -192,6 +200,7 @@ openwrt-install --en               # 英文(纯 ASCII)菜单与全部输出, 中
 openwrt-install --diag             # 诊断: 磁盘/启动盘/候选判定/固件搜索/工具
 openwrt-install -h                 # 查看全部用法
 openwrt-install --no-menu /path/to/openwrt-*.img.gz   # 指定固件
+openwrt-install --no-menu --fw /root/openwrt-*.img.gz # 同上, 用 --fw 指定固件
 openwrt-install --no-menu --disk /dev/sdb             # 指定目标盘(多块盘时必用)
 ```
 

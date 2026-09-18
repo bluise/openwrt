@@ -325,17 +325,26 @@ find_target_disk() {
 }
 
 # ---------- 2. 确定固件路径 ----------
+# 搜索范围里必须有 /root /tmp /home 和当前目录:
+#   从 U 盘启动时镜像在 /mnt 之类, 但在**已装好的系统里**跑安装器时(比如虚拟机
+#   里给第二块空盘装), 镜像通常是被 scp 到 /root 或 /tmp 的 —— 只搜挂载点的话
+#   必然报"找不到固件", 明明镜像就在手边。
+FW_SEARCH_DIRS="/mnt /media /boot /mnt/usb /root /home /tmp /var/tmp /opt"
 find_firmware() {
   if [ -n "$1" ] && [ -f "$1" ]; then
     FW="$1"
-    return
+    return 0
   fi
-  # 搜索常见挂载点中的 combined-efi 镜像
-  for mnt in /mnt /media /boot /mnt/usb; do
+  # 搜索常见目录中的 combined-efi 镜像
+  for mnt in $FW_SEARCH_DIRS; do
     [ -d "$mnt" ] || continue
     FW=$(find "$mnt" -maxdepth 3 -name "*combined-efi*.img.gz" 2>/dev/null | head -1)
     [ -n "$FW" ] && break
   done
+  # 当前目录
+  if [ -z "$FW" ]; then
+    FW=$(find . -maxdepth 2 -name "*combined-efi*.img.gz" 2>/dev/null | head -1)
+  fi
   if [ -z "$FW" ]; then
     # 尝试再次挂载U盘的分区找固件(只找 USB 上的分区, 不碰内置盘)
     # 判据同样来自 sysfs: 原先的 `lsblk -dno TRAN` 在固件里恒为空,
@@ -354,14 +363,60 @@ find_firmware() {
   fi
   if [ -z "$FW" ]; then
     log_err "$(zh_en '未找到固件镜像 *combined-efi*.img.gz!' 'Firmware image *combined-efi*.img.gz not found!')"
-    log_warn "$(zh_en '已查找: /mnt /media /boot /mnt/usb 以及所有 USB 分区(自动挂载尝试过)' \
-                      'Searched: /mnt /media /boot /mnt/usb and every USB partition (auto-mount attempted)')"
-    log_warn "$(zh_en '请把 openwrt-*-combined-efi.img.gz 放到 U 盘/任意可读位置, 或直接指定路径:' \
-                      'Put openwrt-*-combined-efi.img.gz on a USB stick (or any readable path), or pass the path:')"
+    log_warn "$(zh_en "已查找: $FW_SEARCH_DIRS 当前目录, 以及所有 USB 分区(自动挂载尝试过)" \
+                      "Searched: $FW_SEARCH_DIRS the current directory, and every USB partition (auto-mount attempted)")"
+    # 有终端就直接问路径, 不用逼用户自己回去拼 --no-menu
+    if [ -t 0 ] || [ -t 1 ]; then
+      NEWFW=$(input_box "$(zh_en '请输入固件路径' 'Firmware path')" \
+        "$(zh_en 'openwrt-*-combined-efi.img.gz 的完整路径(留空取消):' \
+                   'Full path to openwrt-*-combined-efi.img.gz (empty to cancel):')" "") || return 1
+      if [ -n "$NEWFW" ] && [ -f "$NEWFW" ]; then
+        FW=$NEWFW
+        log_info "$(zh_en "使用固件: $FW" "Using firmware: $FW")"
+        return 0
+      fi
+    fi
+    log_warn "$(zh_en '也可以直接带上路径重跑:' 'Or re-run with the path:')"
     log_warn "  openwrt-install --no-menu /path/to/openwrt-*-combined-efi.img.gz"
     # 注意用 return 而不是 exit: 菜单模式下应退回菜单, 而不是把整个程序结束掉
     return 1
   fi
+  log_info "$(zh_en "找到固件: $FW" "Firmware found: $FW")"
+  return 0
+}
+
+# 目标盘容量是否装得下(未压缩)镜像。
+# 虚拟机里挂一块比镜像小的空盘时, 原先只会得到 dd 的
+# "No space left on device", 完全看不出是盘太小。
+bytes_to_mib() { echo $(( ($1 + 1048575) / 1048576 )); }
+
+image_raw_size() {   # 未压缩镜像大小(字节), 非 gzip 则用文件本身大小
+  magic=$(dd if="$1" bs=1 count=2 status=none 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  if [ "$magic" = "1f8b" ]; then
+    # gzip 尾部 4 字节是 ISIZE(未压缩长度, 小端)
+    sz=$(tail -c 4 "$1" 2>/dev/null | od -An -tu4 2>/dev/null | tr -d ' \n')
+    [ -n "$sz" ] && { echo "$sz"; return 0; }
+  fi
+  wc -c < "$1" 2>/dev/null | tr -d ' '
+}
+
+check_target_size() {
+  IMG_BYTES=$(image_raw_size "$FW")
+  [ -n "$IMG_BYTES" ] && [ "$IMG_BYTES" -gt 0 ] 2>/dev/null || return 0
+  T_SEC=$(disk_sectors "$TARGET")
+  [ -n "$T_SEC" ] && [ "$T_SEC" -gt 0 ] 2>/dev/null || return 0
+  T_BYTES=$(( T_SEC * 512 ))
+  log_info "$(zh_en "镜像(未压缩) $(bytes_to_mib "$IMG_BYTES") MiB   目标盘 $(bytes_to_mib "$T_BYTES") MiB" \
+                    "Image (uncompressed) $(bytes_to_mib "$IMG_BYTES") MiB   target disk $(bytes_to_mib "$T_BYTES") MiB")"
+  if [ "$T_BYTES" -lt "$IMG_BYTES" ]; then
+    log_err "$(zh_en "目标盘太小, 装不下镜像!" "Target disk is too small for the image!")"
+    log_warn "$(zh_en "需要至少 $(bytes_to_mib "$IMG_BYTES") MiB, 而 $TARGET 只有 $(bytes_to_mib "$T_BYTES") MiB。" \
+                      "Needs at least $(bytes_to_mib "$IMG_BYTES") MiB but $TARGET has only $(bytes_to_mib "$T_BYTES") MiB.")"
+    log_warn "$(zh_en '请换一块更大的盘/虚拟磁盘, 或改用更小的镜像。' \
+                      'Use a bigger disk/virtual disk, or a smaller image.')"
+    return 1
+  fi
+  return 0
 }
 
 # ---------- 3. 倒计时 ----------
@@ -990,6 +1045,7 @@ main_menu() {
 do_install() {
   find_target_disk || return 1
   find_firmware "$@" || return 1
+  check_target_size || return 1
   countdown
 
   log_info "$(zh_en '解压并写入镜像...' 'Decompressing and writing the image...')"
@@ -1035,6 +1091,9 @@ Usage: openwrt-install [options] [firmware.img.gz]
   --disk <dev>     target disk, e.g. --disk /dev/sdb
                    (required when several disks exist and there is no terminal;
                     OPENWRT_TARGET_DISK=/dev/sdb works too)
+  --fw <path>      firmware image, e.g. --fw /root/openwrt-*.img.gz
+                   (same as passing it as the last argument; searched by default
+                    in /mnt /media /boot /root /home /tmp /var/tmp /opt and ".")
   --en / --zh      English (pure ASCII) / Chinese menu; same as OPENWRT_UI=en|zh
                    Use --en when the terminal cannot show Chinese (local console
                    without CJK glyphs, or a GBK SSH client). TERM=linux/dumb/empty
@@ -1069,6 +1128,9 @@ EOF
   --disk <设备>   指定目标盘, 例如 --disk /dev/sdb
                   (多块盘且非交互环境下**必须**用它; 也接受
                    OPENWRT_TARGET_DISK=/dev/sdb 环境变量)
+  --fw <路径>     指定固件镜像, 例如 --fw /root/openwrt-*.img.gz
+                  (等价于把它作为最后一个参数; 默认会搜 /mnt /media /boot
+                   /root /home /tmp /var/tmp /opt 和当前目录)
   --en / --zh     菜单用英文(纯 ASCII) / 中文; 等价于 OPENWRT_UI=en|zh
                   终端显示不了中文时(本机控制台没中文字形、或 SSH 客户端
                   用 GBK)用 --en; 本机控制台(TERM=linux)会自动选英文。
@@ -1118,6 +1180,15 @@ main() {
         fi
         FORCE_DISK=$1 ;;
       --disk=*) FORCE_DISK=${1#--disk=} ;;
+      --fw|--firmware)
+        shift
+        if [ -z "${1:-}" ]; then
+          log_err "$(zh_en '--fw 需要一个镜像路径, 例如 --fw /root/openwrt-*.img.gz' \
+                            '--fw needs an image path, e.g. --fw /root/openwrt-*.img.gz')"
+          exit 2
+        fi
+        FW_ARG=$1 ;;
+      --fw=*) FW_ARG=${1#--fw=} ;;
       -*) log_err "$(zh_en "未知选项: $1" "Unknown option: $1")"; usage; exit 2 ;;
       *) FW_ARG=$1 ;;
     esac
