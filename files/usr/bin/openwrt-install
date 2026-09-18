@@ -29,9 +29,9 @@ log_err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # 版本号: 每次改动都换 —— 日志第一行就会打印, 用来判断机器上/镜像里跑的到底是哪一版
 # (真机上出过"脚本改了但跑的还是旧版"的扯皮, 有这一行就不用猜)
-INSTALL_VER="2026-09-19.4"
-INSTALL_MODE_ZH="分区复制安装: 只复制系统分区 + 在目标盘重建分区表(不再整盘 dd)"
-INSTALL_MODE_EN="partition-copy install: copies only the system partitions and rebuilds the target partition table"
+INSTALL_VER="2026-09-19.5"
+INSTALL_MODE_ZH="分区复制安装: 只复制系统分区 + 重建分区表 + 目标盘独立 UUID"
+INSTALL_MODE_EN="partition-copy install: copies only the system partitions, rebuilds the target table and gives it fresh UUIDs"
 
 # =============================================
 # 界面语言 / 终端编码
@@ -608,6 +608,24 @@ part_table() {
 
 disk_label_id() { sfdisk -d "$1" 2>/dev/null | sed -n 's/^label-id: *//p' | head -1; }
 
+# 是不是块设备。单独一个函数便于测试覆盖(文件目标/模拟环境)。
+is_block_dev() { [ -b "${1:-}" ]; }
+
+# 生成一个 v4 UUID。busybox 里没有 uuidgen, 所以自己从 /dev/urandom 取 16 字节拼。
+gen_uuid() {
+  h=$(od -An -tx1 -N 16 /dev/urandom 2>/dev/null | tr -d ' \n')
+  [ ${#h} -eq 32 ] || return 1
+  c17=$(printf '%s' "$h" | cut -c17)
+  case "$c17" in 8|9|a|b) ;; *) c17=8 ;; esac
+  printf '%s-%s-4%s-%s%s-%s' \
+    "$(printf '%s' "$h" | cut -c1-8)"  "$(printf '%s' "$h" | cut -c9-12)"  \
+    "$(printf '%s' "$h" | cut -c14-16)" "$c17"                            \
+    "$(printf '%s' "$h" | cut -c18-20)" "$(printf '%s' "$h" | cut -c21-32)"
+}
+
+# 记录 "<分区号> <源盘UUID> <目标盘新UUID>", 供装完后改写 grub.cfg / fstab 使用
+UUID_MAP=${UUID_MAP:-/tmp/.openwrt_uuidmap.$$}
+
 # sda2 / mmcblk1p2 / nvme0n1p2 / test.img128 -> 分区号
 part_suffix() { s=$1; s=${s##*[!0-9]}; echo "$s"; }
 
@@ -815,6 +833,12 @@ write_target_table() {
   # 先算最终尺寸并检查放得下(sfdisk 遇到越界会直接拒绝, 不如自己先报清楚)
   TABLE_FILE=${TABLE_FILE:-/tmp/.openwrt_tbl2.$$}
   : > "$TABLE_FILE"
+  # 关键: 目标盘用**新生成**的 UUID, 不要照抄源盘。
+  # 照抄的话两块盘的分区 UUID 完全一样 —— 内核按 root=PARTUUID 找根分区时会
+  # 匹到先枚举到的那块(真机上表现为"优盘启动却进了内置盘的系统"), fstab 里按
+  # UUID 的挂载也会互相抢。改成各自独立就彻底没这个问题了。
+  # 需要"逐字节一样的克隆"时用 --same-uuid 保持原样。
+  : > "$UUID_MAP"
   while read -r sfx st sz cp ty uu at pn; do
     [ -n "$st" ] || continue
     fit=$(( tlast - st + 1 ))
@@ -831,7 +855,15 @@ write_target_table() {
                         "Partition $sfx does not fit: needs $(bytes_to_mib $(( need * SECTOR ))) MiB, only $(bytes_to_mib $(( fit * SECTOR ))) MiB available")"
       return 1
     fi
-    printf '%s %s %s %s %s %s %s\n' "$sfx" "$st" "$newsz" "$ty" "$uu" "$at" "$pn" >> "$TABLE_FILE"
+    if [ "$SAME_UUID" = "1" ]; then
+      newuu=$uu
+    else
+      newuu=$(gen_uuid) || newuu=$uu
+    fi
+    if [ -n "$newuu" ] && [ "$newuu" != "$uu" ]; then
+      printf '%s %s %s\n' "$sfx" "$(printf '%s' "$uu" | tr 'A-Z' 'a-z')" "$newuu" >> "$UUID_MAP"
+    fi
+    printf '%s %s %s %s %s %s %s\n' "$sfx" "$st" "$newsz" "$ty" "$newuu" "$at" "$pn" >> "$TABLE_FILE"
     :
   done < "$PLAN_FILE"
 
@@ -865,6 +897,68 @@ last-lba: $tlast
     return 1
   fi
   sync
+  return 0
+}
+
+# 目标盘上"引用源盘 UUID"的地方都要改成新 UUID。
+# 固件里只有两处会引用分区 UUID:
+#   1) ESP 上的 /boot/grub/grub.cfg —— linux ... root=PARTUUID=<rootfs 分区>
+#      (不改成新值, 内置盘就永远去挂优盘那份 rootfs, 这正是"两块盘打架"的根因)
+#   2) /etc/config/fstab(首次启动时生成的, 可能按 UUID 挂 /boot)
+# 这两处分别在 vfat 与 ext4 分区里, 所以临时挂载它们；改完立刻卸载,
+# 后面 e2fsck/resize2fs 要求未挂载。
+rewrite_target_uuids() {
+  [ -s "$UUID_MAP" ] || return 0
+  log_info "$(zh_en '把目标盘里的 PARTUUID 引用改成新值...' 'Rewriting PARTUUID references on the target...')"
+  # 注意: 不能"每个分区只改自己的 UUID" —— 引用关系是跨分区的:
+  #   /boot/grub/grub.cfg 在 ESP(分区1) 上, 里面写的却是 **rootfs(分区2)** 的 UUID。
+  # 所以做法是: 逐个挂载参与安装的分区, 在里面把所有旧 UUID 一次性换成对应的新值。
+  while read -r sfx st sz cp ty uu at pn; do
+    [ -n "$sfx" ] || continue
+    pdev=$(target_part_dev "$sfx")
+    is_block_dev "$pdev" || continue
+    mnt="/tmp/.owrt_mnt_$sfx"
+    rm -rf "$mnt"; mkdir -p "$mnt"
+    if mount -t vfat "$pdev" "$mnt" 2>/dev/null; then
+      scan_dirs="/boot /EFI"
+    elif mount -t ext4 "$pdev" "$mnt" 2>/dev/null; then
+      scan_dirs="/etc"
+    else
+      rmdir "$mnt" 2>/dev/null || true
+      continue
+    fi
+    cnt=0
+    for d in $scan_dirs; do
+      [ -d "$mnt$d" ] || continue
+      for f in $(find "$mnt$d" -type f 2>/dev/null); do
+        # 只碰小文件(引导配置/配置), 避免误改大二进制
+        fsz=$(wc -c < "$f" 2>/dev/null | tr -d ' ' || echo 0)
+        [ -n "$fsz" ] && [ "$fsz" -lt 1048576 ] 2>/dev/null || continue
+        hit=""
+        while read -r msfx mold mnew; do
+          [ -n "$mold" ] && [ -n "$mnew" ] || continue
+          mold_up=$(printf '%s' "$mold" | tr 'a-z' 'A-Z')
+          if grep -q "$mold" "$f" 2>/dev/null || grep -q "$mold_up" "$f" 2>/dev/null; then
+            sed -i "s/$mold/$mnew/g" "$f" 2>/dev/null || true
+            mnew_up=$(printf '%s' "$mnew" | tr 'a-z' 'A-Z')
+            sed -i "s/$mold_up/$mnew_up/g" "$f" 2>/dev/null || true
+            hit="$hit $mold"
+          fi
+          :
+        done < "$UUID_MAP"
+        if [ -n "$hit" ]; then
+          cnt=$((cnt + 1))
+          log_info "$(zh_en "  已更新: ${f#$mnt}" "  updated: ${f#$mnt}")"
+        fi
+        :
+      done
+    done
+    sync
+    umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
+    rmdir "$mnt" 2>/dev/null || true
+    log_info "$(zh_en "  分区 $sfx: 改写了 $cnt 个文件" "  partition $sfx: $cnt file(s) rewritten")"
+    :
+  done < "$PLAN_FILE"
   return 0
 }
 
@@ -1629,6 +1723,8 @@ do_install() {
     copy_plan "$CLONE_SRC_PATH" "$TARGET" || return 1
     write_target_table "$TARGET" || return 1
     sync
+    # 给目标盘生成独立的 UUID, 并把 grub.cfg/fstab 里的引用同步改掉
+    rewrite_target_uuids || true
     grow_target_rootfs || true
   elif command -v gunzip >/dev/null 2>&1; then
     log_info "$(zh_en '解压并写入镜像...' 'Decompressing and writing the image...')"
@@ -1646,10 +1742,17 @@ do_install() {
   log_info "$(zh_en '安装完成! 请拔掉U盘重启, 首次启动约需2-3分钟.' \
                     'Done! Unplug the USB stick and reboot; first boot takes 2-3 minutes.')"
   if [ "$CLONE" = "1" ]; then
-    # 克隆出来的是源盘的逐字节副本, 所以两块盘的分区 UUID 是一样的 ——
-    # 同时插着两块盘开机时引导可能挑到 U 盘那份, 所以这句必须强调。
-    log_warn "$(zh_en '克隆安装: 目标盘与源盘的分区 UUID 相同, 重启前务必拔掉 U 盘!' \
-                      'Clone install: target has the same partition UUIDs as the source - remove the USB stick before rebooting!')"
+    if [ "$SAME_UUID" = "1" ]; then
+      # 用了 --same-uuid: 两块盘的分区 UUID 相同, 必须拔优盘
+      log_warn "$(zh_en '本次用了 --same-uuid: 目标盘与源盘的分区 UUID 相同, 重启前务必拔掉 U 盘!' \
+                        '--same-uuid was used: target and source share PARTUUIDs - unplug the USB stick before rebooting!')"
+    else
+      # 新 UUID: 两块盘各自的 grub.cfg 都指向自己, 不会互相干扰
+      log_info "$(zh_en '目标盘已生成自己的 PARTUUID(与源盘不同), grub.cfg 里的 root= 也同步改过。' \
+                        'The target got its own PARTUUIDs (different from the source) and grub.cfg was updated to match.')"
+      log_warn "$(zh_en '不过机器的 uEFI 可能仍优先从内置盘启动: 想从优盘启动就按 F12 选它; 最省事仍是装完拔掉优盘。' \
+                        'Note: the machine firmware may still prefer the internal disk: press F12 to pick the USB when you need it. Unplugging the USB is still the simplest option.')"
+    fi
   fi
 
   # 这里是"重启后怎么进去"的提示, 必须按当前 uci 配置来读。
@@ -1682,6 +1785,9 @@ Usage: openwrt-install [options] [firmware.img.gz]
   --force          kept for compatibility: writing the disk is always forced now
                    (it no longer refuses just because partitions are mounted;
                     the boot disk itself is still refused)
+  --same-uuid      keep the source's partition UUIDs on the target (byte-identical
+                   clone; both disks then fight over root=PARTUUID, so unplug the
+                   USB before rebooting). Default is to generate NEW UUIDs.
   --diag           print diagnostics (disks, boot disk, candidates, the
                    partition copy plan, tools) - run this when an install fails
   --disk <dev>     target disk, e.g. --disk /dev/sdb
@@ -1721,6 +1827,9 @@ EOF
   --change-ip     直接进入"修改 LAN 口 IP"功能(对应 quickstart 的改 IP)
   --clone         兼容写法: 现在"装当前系统的分区到目标盘"就是默认行为, 加不加都一样
   --force         兼容开关: 现在默认就会直接写盘(不再因为"分区被占用"拒绝); 启动盘仍会拒绝
+  --same-uuid     目标盘沿用源盘的分区 UUID(逐字节等价克隆)。两块盘同时插着时会因为
+                  root=PARTUUID 相同而互相抢, 必须拔掉优盘再重启。
+                  默认行为是给目标盘**生成全新的 UUID**(推荐, 详见 README)。
   --diag          打印诊断信息(磁盘/启动盘/候选判定/分区复制计划/工具), 装不上时先跑这个
   --disk <设备>   指定目标盘, 例如 --disk /dev/sdb
                   (多块盘且非交互环境下**必须**用它; 也接受
@@ -1757,6 +1866,7 @@ main() {
   FORCE_DISK=${OPENWRT_TARGET_DISK:-}
   FORCE_CLONE=""
   FORCE_WIPE=""
+  SAME_UUID=""
 
   # 先按环境定一次语言(让解析阶段的报错也是对的), 解析完再按 --en/--zh 重定一次
   ui_setup
@@ -1770,6 +1880,7 @@ main() {
       --diag|--check) MODE=diag ;;
       --clone) MODE=install ;;   # 兼容旧写法: 现在默认就是克隆
       --force|-f) FORCE_WIPE=1 ;;   # 允许写"活动分区在挂载"的盘(仍先尝试卸载; 启动盘依旧拒绝)
+      --same-uuid) SAME_UUID=1 ;;   # 目标盘沿用源盘的 UUID(逐字节等价克隆; 两块盘同时插着会打架)
       --en|--english) UI_FORCE=en ;;
       --zh|--chinese) UI_FORCE=zh ;;
       --disk)

@@ -212,14 +212,18 @@ openwrt-install --en     # 或 OPENWRT_UI=en openwrt-install
 - **不是整盘 dd**：把源盘上"rootfs 之前的分区（`/boot` 等启动链）+ rootfs 本身"
   按原偏移复制到目标盘，rootfs 之后的分区（数据盘、旧 overlay）不复制
   —— 所以 **128 GB 的 U 盘也能装进 7.2 GB 的内置盘**，实际写入量约 2.1 GB
-- 目标盘上重建 GPT：`start`/`type`/`uuid`/`attrs` 全部照抄源盘 ⇒ **PARTUUID 不变**，
-  `grub.cfg` 里的 `root=PARTUUID=...` 无需修改；分区号（1 / 2 / 128）也保持不变
+- 目标盘上重建 GPT：`start`/`type`/`attrs` 与分区号（1 / 2 / 128）**照抄源盘**，
+  但 `uuid` **重新生成**（每个分区一套新的）⇒ 两块盘的 PARTUUID 不再相同
+- 目标盘里所有引用旧 UUID 的地方会一起改掉：ESP 上的 `/boot/grub/grub.cfg`
+  （`root=PARTUUID=...`，含 failsafe 那行）以及 `/etc/config/fstab` 之类按 UUID 挂载的配置
+  —— 所以**两块盘各自引导到自己的系统**，互不干扰（`--same-uuid` 可退回"逐字节等价克隆"）
 - **ext4 版**：rootfs 分区扩到盘尾，装完自动 `e2fsck -f -y` + `resize2fs` 占满整盘
   （例如 7.2 GB 的内置盘 → 根文件系统约 7.3 GB 可用）
 - **squashfs 版**：rootfs 只读，保持镜像里的 2048 MiB，剩余空间不分配
   （与直接刷镜像的行为一致）
-- **装完必须拔掉 U 盘再启动**：克隆盘的分区 UUID 和源盘相同，两块盘同时插着时
-  引导可能挑到 U 盘那份（完成提示里会再强调一次）
+- **装完建议拔掉 U 盘再启动**：现在目标盘有自己的 UUID、`grub.cfg` 也指向它自己，
+  两块盘同时插着不会互相抢根分区；但机器的 uEFI 可能仍优先从内置盘启动
+  （想用优盘启动时开机按 **F12** 选它）
 - 特殊场景想要"写指定的镜像文件"仍然可以：`openwrt-install --fw /root/xxx.img.gz`
   （或把路径作为最后一个参数）—— 只是平时用不到
 
