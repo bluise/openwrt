@@ -41,18 +41,23 @@ log_err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 #   openwrt-install --zh        强制中文界面
 #   OPENWRT_UI=en|zh            同样效果的环境变量
 # 默认: TERM 为空/dumb/linux(通常就是本机控制台)时用英文, 其余用中文。
+#   注意: 本机控制台(VGA/虚拟机控制台/串口)用的是内核 8x16 位图字体, 里头
+#   根本没有汉字字形 —— 那种终端上中文是**画不出来**的, 跟固件无关。
+#   想要中文就在支持 UTF-8 的终端里 SSH 上来跑(TERM=xterm-*), 会自动用中文。
 # 报告正文(空间检测那一段)不翻译: 里面主要是路径/扇区/命令, 本身是 ASCII。
 UI_FORCE=""
 UI_EN=""
+UI_AUTO_EN=""     # 1 = 是我们自动切成英文的(而非用户强制), 用于给出一句解释
 
 ui_setup() {
   lang=${UI_FORCE:-${OPENWRT_UI:-auto}}
+  UI_AUTO_EN=""
   case "$lang" in
     en|EN|English|english) UI_EN=1 ;;
     zh|ZH|Chinese|chinese) UI_EN="" ;;
     *)
       case "${TERM:-}" in
-        ""|dumb|linux) UI_EN=1 ;;
+        ""|dumb|linux) UI_EN=1; UI_AUTO_EN=1 ;;
         *) UI_EN="" ;;
       esac ;;
   esac
@@ -64,6 +69,13 @@ ui_setup() {
   LANG=C.UTF-8
   export LC_ALL LANG
   return 0
+}
+
+# 自动切英文时, 在菜单里带一句解释(TERM=linux 的终端画不出汉字)
+ui_note() {
+  if [ "$UI_EN" = "1" ] && [ "$UI_AUTO_EN" = "1" ]; then
+    printf ' [English UI: TERM=%s cannot display CJK; SSH in for Chinese / --zh]' "${TERM:-empty}"
+  fi
 }
 
 # 双语取值: zh_en '中文' 'English'
@@ -1088,7 +1100,7 @@ text_menu() {
   while :; do
     cat <<EOF
 
-======== $(zh_en 'OpenWrt 安装助手' 'OpenWrt Installer') ========
+======== $(zh_en 'OpenWrt 安装助手' 'OpenWrt Installer') ========$(ui_note)
   1) $(zh_en '安装系统到内置硬盘 (会清空目标盘!)' 'Install to internal disk (ERASES the target disk!)')
   2) $(zh_en '查看磁盘与空间状态' 'Show disks and space status')
   3) $(zh_en '修改 LAN 口 IP 地址' 'Change LAN IP address')
@@ -1148,7 +1160,7 @@ main_menu() {
     # --cancel-button: Esc 或"取消"按钮都直接退出(菜单项被截断时也能退出来)
     CHOICE=$(whiptail --title "$(zh_en 'OpenWrt 安装助手' 'OpenWrt Installer')" \
       --cancel-button "$(zh_en '退出' 'Quit')" --menu \
-      "$(zh_en '请选择要执行的操作 (Esc=退出):' 'Select an action (Esc = quit):')" 22 76 9 \
+      "$(zh_en '请选择要执行的操作 (Esc=退出):' 'Select an action (Esc = quit):')$(ui_note)" 22 76 9 \
       "1" "$(zh_en '安装系统到内置硬盘 (会清空目标盘!)' 'Install to internal disk (ERASES the target disk!)')" \
       "2" "$(zh_en '查看磁盘与空间状态' 'Show disks and space status')" \
       "3" "$(zh_en '修改 LAN 口 IP 地址' 'Change LAN IP address')" \
