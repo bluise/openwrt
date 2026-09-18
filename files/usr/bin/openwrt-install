@@ -130,10 +130,18 @@ list_disks() {
 
 # 启动盘: OpenWrt 里 /rom 是真实根文件系统所在(overlay 的 / 不行),
 # 读不到再退到内核命令行 root=
+#
+# 注意 /proc/mounts 的列序是: 设备 挂载点 类型 选项 ...
+# 挂载点是**第 2 列**。原先写成 $3 比的是文件系统类型, 永远匹配不上,
+# 只是宿主上恰好有 findmnt 兜住才没暴露 —— 而 OpenWrt 里没有 findmnt,
+# 于是真机上"启动盘识别失败", 正在运行的系统盘会被当成可写候选盘(危险)。
 find_boot_src() {
   BOOT_SRC=""
   for mp in /rom /; do
-    s=$(awk -v m="$mp" '$3 == m {print $1; exit}' /proc/mounts 2>/dev/null || true)
+    s=$(awk -v m="$mp" '$2 == m {print $1; exit}' /proc/mounts 2>/dev/null || true)
+    if [ -z "$s" ]; then
+      s=$(awk -v m="$mp" '$5 == m {print $1; exit}' /proc/self/mountinfo 2>/dev/null || true)
+    fi
     if [ -z "$s" ]; then
       s=$(findmnt -no SOURCE "$mp" 2>/dev/null || true)
     fi
@@ -185,6 +193,23 @@ is_boot_disk() {
   return 1
 }
 
+# 凡是"有分区正在被挂载"的整盘都算在用 —— 这是启动盘识别的兜底保护。
+# 虚拟机里 /proc/cmdline 常用 root=PARTUUID=... , 万一启动盘识别不出来,
+# 这条也能挡住"把正在运行的系统盘当目标盘"。
+# (OpenWrt x86 上 /rom 与 /boot 都是真实分区, 所以运行盘一定在这里面。)
+# 走 boot_disks_of 是为了把 dm/md 叠加(LVM/RAID)解析回物理整盘。
+mounted_disks() {
+  awk '$1 ~ /^\/dev\// {print $1}' /proc/mounts 2>/dev/null \
+  | while read -r dev; do boot_disks_of "$dev"; done | sort -u | tr '\n' ' '
+}
+
+is_mounted_disk() {
+  for b in $MOUNTED_DISKS; do
+    [ "$b" = "$1" ] && return 0
+  done
+  return 1
+}
+
 # 人类可读的盘信息: 容量 + 型号 (供候选列表与倒计时显示)
 disk_desc() {
   d=$(basename "$1")
@@ -218,13 +243,14 @@ find_target_disk() {
 
   TARGET=""
   BOOT_DISKS=$(find_boot_disks 2>/dev/null || true)
+  MOUNTED_DISKS=$(mounted_disks)
   if [ -n "$BOOT_DISKS" ]; then
     for b in $BOOT_DISKS; do
       log_info "$(zh_en "启动盘: /dev/$b  ($(disk_desc "$b"))" "Boot disk: /dev/$b  ($(disk_desc "$b"))")"
     done
   else
-    log_warn "$(zh_en '无法识别启动盘(不影响安装, 但请确认目标盘没写错)' \
-                      'Could not identify the boot disk (installation still works, but double-check the target)')"
+    log_warn "$(zh_en '无法识别启动盘 —— 改用"有分区正在挂载的盘"来保护运行中的系统' \
+                      'Could not identify the boot disk - falling back to excluding disks with mounted partitions')"
   fi
 
   # (1) 显式指定
@@ -234,9 +260,9 @@ find_target_disk() {
       log_err "$(zh_en "指定的目标盘不存在: $FORCE_DISK" "Target disk does not exist: $FORCE_DISK")"
       return 1
     fi
-    if is_boot_disk "$f"; then
-      log_err "$(zh_en "$FORCE_DISK 是当前启动盘, 拒绝写入(会清空正在运行的系统)" \
-                        "$FORCE_DISK is the running boot disk - refusing to wipe the live system")"
+    if is_boot_disk "$f" || is_mounted_disk "$f"; then
+      log_err "$(zh_en "$FORCE_DISK 正在被使用(启动盘, 或上面有已挂载的分区), 拒绝写入" \
+                        "$FORCE_DISK is in use (boot disk, or it has a mounted partition) - refusing")"
       log_warn "$(zh_en '  要重刷这块盘: 从 U 盘启动后再执行, 或直接用 sysupgrade 升级。' \
                         '  To reflash it: boot from the USB stick first, or use sysupgrade.')"
       return 1
@@ -257,6 +283,13 @@ find_target_disk() {
       log_warn "$(zh_en "跳过启动盘 /dev/$d" "Skipping boot disk /dev/$d")"
       continue
     fi
+    if is_mounted_disk "$d"; then
+      log_warn "$(zh_en "跳过正在使用的盘 /dev/$d (上面有已挂载的分区)" \
+                        "Skipping disk in use /dev/$d (it has a mounted partition)")"
+      log_warn "$(zh_en "  确实要写它: 先 umount 它上面的分区再重试" \
+                        "  If you really mean it: umount its partitions first, then retry")"
+      continue
+    fi
     if [ "$(disk_transport "$d")" = "usb" ]; then
       log_warn "$(zh_en "跳过USB设备 /dev/$d" "Skipping USB device /dev/$d")"
       continue
@@ -270,12 +303,12 @@ find_target_disk() {
 
   if [ "$N" -eq 0 ]; then
     log_err "$(zh_en '未找到可写入的硬盘!' 'No writable disk found!')"
-    log_warn "$(zh_en "已排除启动盘(${BOOT_DISKS:-未知})与所有 USB 设备。" \
-                      "Excluded: boot disk (${BOOT_DISKS:-unknown}) and all USB devices.")"
+    log_warn "$(zh_en "已排除: 启动盘(${BOOT_DISKS:-未知})、正在挂载中的盘(${MOUNTED_DISKS:-无})、所有 USB 设备。" \
+                      "Excluded: boot disk (${BOOT_DISKS:-unknown}), mounted disks (${MOUNTED_DISKS:-none}), all USB devices.")"
     log_warn "$(zh_en '要写到外置盘/U盘请显式指定: openwrt-install --disk /dev/sdX' \
                       'To write to an external/USB disk, name it: openwrt-install --disk /dev/sdX')"
-    log_warn "$(zh_en '若这台机器只有一块盘且正是启动盘: 请从 U 盘启动后再装, 或用 sysupgrade 升级。' \
-                      'If this machine has only one disk and it is the boot disk: boot from the USB stick, or use sysupgrade.')"
+    log_warn "$(zh_en '若这台机器只有一块盘且正在运行它: 请从 U 盘启动后再装, 或用 sysupgrade 升级。' \
+                      'If this machine only has the disk it is running from: boot from USB, or use sysupgrade.')"
     return 1
   fi
 
@@ -309,8 +342,39 @@ find_target_disk() {
     return 1
   fi
 
-  printf '%s' "$(zh_en '请输入编号并回车: ' 'Enter a number and press Enter: ')"
-  read -r SEL
+  # 有 whiptail 就用菜单选(方向键+回车, Esc 取消)。
+  # 之前这里是文本提示: 刚从 whiptail 对话框出来时, 回车可能还留在输入缓冲里,
+  # 被 read 吃掉就变成"空选择 -> Invalid selection -> 安装失败"(真机踩到过)。
+  if [ -n "$HAS_WT" ]; then
+    # 这里的 set -- 只用于拼 whiptail 参数。do_install 已把固件路径存进变量,
+    # 不再依赖调用者的 "$@", 所以清空位置参数是安全的。
+    set -- --title "$(zh_en '选择目标盘' 'Select target disk')" \
+           --cancel-button "$(zh_en '取消' 'Cancel')" --menu \
+           "$(zh_en "检测到 $N 块可写入的盘, 方向键选择(Esc=取消):" \
+                      "Found $N writable disks, pick one (Esc = cancel):")" 20 76 8
+    i=0
+    for d in $CAND; do
+      i=$((i + 1))
+      set -- "$@" "$i" "/dev/$d  ($(disk_desc "$d"))"
+    done
+    SEL=$(whiptail "$@" 3>&1 1>&2 2>&3) || return 1
+  else
+    # 纯文本场景: 空行(可能是上一次对话框残留的回车)不判死, 重问几次
+    SEL=""
+    tries=0
+    while [ -z "$SEL" ] && [ "$tries" -lt 3 ]; do
+      tries=$((tries + 1))
+      printf '%s' "$(zh_en '请输入编号并回车(0=取消): ' 'Enter a number (0 = cancel): ')"
+      read -r SEL || SEL=0
+      case "$SEL" in
+        0|q|Q) log_info "$(zh_en '已取消' 'Cancelled')"; return 1 ;;
+        "") log_warn "$(zh_en '没读到输入, 请再输一次编号' 'No input read, please type the number again')"; continue ;;
+        *[!0-9]*) log_warn "$(zh_en "不是编号: $SEL" "Not a number: $SEL")"; SEL=""; continue ;;
+      esac
+    done
+    [ -n "$SEL" ] || { log_err "$(zh_en '没有选择, 放弃' 'No selection, giving up')"; return 1; }
+  fi
+
   i=0
   for d in $CAND; do
     i=$((i + 1))
@@ -978,6 +1042,7 @@ show_diag() {
   echo "-- $(zh_en '启动盘解析' 'boot disk resolution') --"
   echo "  src  = $(find_boot_src 2>/dev/null || zh_en '(未识别)' '(unidentified)')"
   echo "  disk = ${BOOT_DISKS:-$(find_boot_disks 2>/dev/null || zh_en '(未识别)' '(unidentified)')}"
+  echo "  $(zh_en '有分区在挂载的盘(会被保护)' 'disks with mounted partitions (protected)'): ${MOUNTED_DISKS:-$(mounted_disks)}"
   echo
   echo "-- $(zh_en '候选判定' 'candidate decision') --"
   for d in $(list_disks); do
@@ -1160,8 +1225,11 @@ main_menu() {
 
 # ---------- 安装流程 ----------
 do_install() {
+  # 先把固件路径存进变量: find_target_disk 内部会用 set -- 拼 whiptail 参数,
+  # 不能让它依赖调用者的位置参数("$@")。
+  FW_PATH=$1
   find_target_disk || return 1
-  find_firmware "$@" || return 1
+  find_firmware "$FW_PATH" || return 1
   check_target_size || return 1
   countdown
 
