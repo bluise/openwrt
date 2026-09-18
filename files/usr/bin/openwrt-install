@@ -1078,13 +1078,11 @@ text_menu() {
 
 ======== $(zh_en 'OpenWrt 安装助手' 'OpenWrt Installer') ========$(ui_note)
   1) $(zh_en '安装系统到内置硬盘 (克隆当前系统, 会清空目标盘!)' 'Install to internal disk (clones the running system, ERASES it!)')
-  2) $(zh_en '查看磁盘与空间状态' 'Show disks and space status')
-  3) $(zh_en '修改 LAN 口 IP 地址' 'Change LAN IP address')
-  4) $(zh_en '修改 root 密码' 'Change root password')
-  5) $(zh_en '查看网络接口' 'Show network interfaces')
-  6) $(zh_en '显示扩容命令(如需要)' 'Show resize commands (if needed)')
-  7) $(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')
-  8) $(zh_en '诊断(装不上时先看这个)' 'Diagnose (run this when install fails)')
+  2) $(zh_en '修改 LAN 口 IP 地址' 'Change LAN IP address')
+  3) $(zh_en '修改 root 密码' 'Change root password')
+  4) $(zh_en '查看网络接口' 'Show network interfaces')
+  5) $(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')
+  6) $(zh_en '诊断(装不上时先看这个)' 'Diagnose (run this when install fails)')
   0) $(zh_en '退出 (输入 q 也可以)' 'Quit (or type q)')
 ========================================
 EOF
@@ -1096,14 +1094,7 @@ EOF
         read -r A
         case "$A" in y|Y) do_install || true ;; *) echo "$(zh_en '已取消' 'Cancelled')" ;; esac
         ;;
-      2|6)
-        if find_target_disk --first >/dev/null 2>&1; then
-          post_install_space_report "$TARGET" || true
-        else
-          echo "$(zh_en '未找到可用的硬盘(详见上面的排除原因)。' 'No writable disk found (see the reasons above).')"
-        fi
-        ;;
-      3)
+      2)
         printf '%s' "$(zh_en '请输入新的 LAN 口 IP: ' 'New LAN IP: ')"
         read -r NIP
         if [ -n "$NIP" ]; then
@@ -1116,10 +1107,10 @@ EOF
           fi
         fi
         ;;
-      4) passwd root ;;
-      5) show_interfaces ;;
-      7) set_nic_mode || true ;;
-      8)
+      3) passwd root ;;
+      4) show_interfaces ;;
+      5) set_nic_mode || true ;;
+      6)
         show_diag
         printf '%s' "$(zh_en '按回车继续...' 'Press Enter to continue...')"
         read -r _x || true
@@ -1136,15 +1127,13 @@ main_menu() {
     # --cancel-button: Esc 或"取消"按钮都直接退出(菜单项被截断时也能退出来)
     CHOICE=$(whiptail --title "$(zh_en 'OpenWrt 安装助手' 'OpenWrt Installer')" \
       --cancel-button "$(zh_en '退出' 'Quit')" --menu \
-      "$(zh_en '请选择要执行的操作 (Esc=退出):' 'Select an action (Esc = quit):')$(ui_note)" 22 76 9 \
+      "$(zh_en '请选择要执行的操作 (Esc=退出):' 'Select an action (Esc = quit):')$(ui_note)" 20 76 7 \
       "1" "$(zh_en '安装系统到内置硬盘 (克隆当前系统, 会清空目标盘!)' 'Install to internal disk (clones the running system, ERASES it!)')" \
-      "2" "$(zh_en '查看磁盘与空间状态' 'Show disks and space status')" \
-      "3" "$(zh_en '修改 LAN 口 IP 地址' 'Change LAN IP address')" \
-      "4" "$(zh_en '修改 root 密码' 'Change root password')" \
-      "5" "$(zh_en '查看网络接口' 'Show network interfaces')" \
-      "6" "$(zh_en '显示扩容命令(如需要)' 'Show resize commands (if needed)')" \
-      "7" "$(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')" \
-      "8" "$(zh_en '诊断(装不上时先看这个)' 'Diagnose (run this when install fails)')" \
+      "2" "$(zh_en '修改 LAN 口 IP 地址' 'Change LAN IP address')" \
+      "3" "$(zh_en '修改 root 密码' 'Change root password')" \
+      "4" "$(zh_en '查看网络接口' 'Show network interfaces')" \
+      "5" "$(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')" \
+      "6" "$(zh_en '诊断(装不上时先看这个)' 'Diagnose (run this when install fails)')" \
       "0" "$(zh_en '退出' 'Quit')" \
       3>&1 1>&2 2>&3) || return 0
     case "$CHOICE" in
@@ -1179,27 +1168,11 @@ main_menu() {
           fi
         fi
         ;;
-      2|6)
-        if find_target_disk --first >/dev/null 2>&1; then
-          TMPF=$(mktemp 2>/dev/null || echo /tmp/.ospace.$$)
-          post_install_space_report "$TARGET" >"$TMPF" 2>&1 || true
-          TXT=$(sed 's/\x1b\[[0-9;]*m//g' "$TMPF" 2>/dev/null)
-          rm -f "$TMPF"
-          if [ "$CHOICE" = "2" ]; then
-            msg "$(zh_en '磁盘与空间状态' 'Disks and space')" "${TXT:-$(zh_en '未获取到信息' 'no information')}"
-          else
-            msg "$(zh_en '扩容命令' 'Resize commands')" "${TXT:-$(zh_en '当前无需扩容' 'no resize needed')}"
-          fi
-        else
-          msg "$(zh_en '错误' 'Error')" \
-            "$(zh_en '未找到可用的硬盘(启动盘与 USB 设备已被排除)。' 'No writable disk found (boot disk and USB devices are excluded).')"
-        fi
-        ;;
-      3) change_lan_ip || true ;;
-      4) change_password ;;
-      5) show_interfaces ;;
-      7) set_nic_mode || true ;;
-      8)
+      2) change_lan_ip || true ;;
+      3) change_password ;;
+      4) show_interfaces ;;
+      5) set_nic_mode || true ;;
+      6)
         TMPF=$(mktemp 2>/dev/null || echo /tmp/.odiag.$$)
         show_diag >"$TMPF" 2>&1 || true
         TXT=$(sed 's/\x1b\[[0-9;]*m//g' "$TMPF" 2>/dev/null)
