@@ -2,7 +2,8 @@
 # =============================================
 # openwrt-install : 一键安装 OpenWrt 到内置硬盘
 # 用法: openwrt-install [选项] [固件路径]
-#   - 不带参数时自动查找当前启动介质上的固件(挂载点或U盘里的 *combined-efi*.img.gz)
+#   - 默认就是"克隆安装": 把当前运行的介质(U盘)整盘复制到内置盘, 不需要镜像文件/网络
+#     (只有显式给路径时才写镜像文件: openwrt-install --fw /path/to/*.img.gz)
 #   - 自动识别内置盘并**排除启动盘与U盘**, 判断全部读 sysfs
 #     (不能用 lsblk: 固件里没有该命令, 详见下面的说明)
 #   - 多块候选盘时列出让你选; 非交互环境不会瞎猜, 必须用 --disk 指定
@@ -91,8 +92,7 @@ zh_en() {
 # 判断依据全部来自 sysfs, 不用 lsblk:
 #   lsblk 是 util-linux 的独立包, 缺省固件里没有(packages.list 也没加),
 #   busybox 更不提供该 applet。原先用 `lsblk -dno TRAN` 判断 USB, 在真机上
-#   恒为空字符串 —— 后果是 U 盘从不被跳过, 且 find_firmware 的"挂载U盘
-#   找固件"分支永远不生效。改成读 sysfs 路径后与工具包无关。
+#   恒为空字符串 —— 后果是 U 盘从不被跳过。改成读 sysfs 路径后与工具包无关。
 
 # 设备名 -> 整盘名: sda2->sda, nvme0n1p2->nvme0n1, mmcblk0p2->mmcblk0
 disk_of_part() {
@@ -400,194 +400,6 @@ find_target_disk() {
   return 1
 }
 
-# ---------- 2. 确定固件路径 ----------
-# 搜索范围里必须有 /root /tmp /home 和当前目录:
-#   从 U 盘启动时镜像在 /mnt 之类, 但在**已装好的系统里**跑安装器时(比如虚拟机
-#   里给第二块空盘装), 镜像通常是被 scp 到 /root 或 /tmp 的 —— 只搜挂载点的话
-#   必然报"找不到固件", 明明镜像就在手边。
-FW_SEARCH_DIRS="/mnt /media /boot /mnt/usb /root /home /tmp /var/tmp /opt"
-find_firmware() {
-  if [ -n "$1" ] && [ -f "$1" ]; then
-    FW="$1"
-    return 0
-  fi
-  # 搜索常见目录中的 combined-efi 镜像
-  for mnt in $FW_SEARCH_DIRS; do
-    [ -d "$mnt" ] || continue
-    FW=$(find "$mnt" -maxdepth 3 -name "*combined-efi*.img.gz" 2>/dev/null | head -1)
-    [ -n "$FW" ] && break
-  done
-  # 当前目录
-  if [ -z "$FW" ]; then
-    FW=$(find . -maxdepth 2 -name "*combined-efi*.img.gz" 2>/dev/null | head -1)
-  fi
-  if [ -z "$FW" ]; then
-    # 尝试再次挂载U盘的分区找固件(只找 USB 上的分区, 不碰内置盘)
-    # 判据同样来自 sysfs: 原先的 `lsblk -dno TRAN` 在固件里恒为空,
-    # 导致这个分支实际上从来没执行过。
-    for p in /sys/class/block/*; do
-      [ -e "$p/partition" ] || continue
-      part=$(basename "$p")
-      [ -b "/dev/$part" ] || continue
-      [ "$(disk_transport "$(disk_of_part "$part")")" = "usb" ] || continue
-      mkdir -p /mnt/usb
-      mount "/dev/$part" /mnt/usb 2>/dev/null || continue
-      FW=$(find /mnt/usb -maxdepth 3 -name "*combined-efi*.img.gz" 2>/dev/null | head -1)
-      [ -n "$FW" ] && break
-      umount /mnt/usb 2>/dev/null || true
-    done
-  fi
-  if [ -z "$FW" ]; then
-    fw_not_found_fallback && return 0
-    return 1
-  fi
-  log_info "$(zh_en "找到固件: $FW" "Firmware found: $FW")"
-  return 0
-}
-
-# 用户给的值 -> 镜像文件路径。允许: 文件 / 目录(在目录里找) / 通配符结果
-fw_resolve_value() {
-  v=$1
-  [ -n "$v" ] || return 1
-  if [ -f "$v" ]; then echo "$v"; return 0; fi
-  if [ -d "$v" ]; then
-    f=$(find "$v" -maxdepth 3 -name "*combined-efi*.img.gz" 2>/dev/null | head -1)
-    [ -n "$f" ] && { echo "$f"; return 0; }
-    return 1
-  fi
-  # 通配符/相对路径
-  for f in $v; do
-    [ -f "$f" ] && { echo "$f"; return 0; }
-  done
-  return 1
-}
-
-# 全盘(排除伪文件系统)扫 *.img.gz / *.img, 给用户挑。
-# 用 -xdev 只在根文件系统里扫: 设备上 / 很小(百来 MB), 不会去翻挂在 /mnt 下的大数据盘
-scan_firmware_anywhere() {
-  find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /rom \) -prune -o \
-       -type f \( -name '*.img.gz' -o -name '*.img' \) -print 2>/dev/null | head -20
-}
-
-# 本设备对应的 Release 资产文件名($1 = ext4|squashfs); 读不到版本就输出空
-FW_DL_BASE="https://github.com/bluise/openwrt/releases/download/firmware"
-fw_asset_name() {
-  rel=$(sed -n "s/^DISTRIB_RELEASE=['\"]*\([^'\"]*\).*/\1/p" /etc/openwrt_release 2>/dev/null | head -1)
-  tgt=$(sed -n "s/^DISTRIB_TARGET=['\"]*\([^'\"]*\).*/\1/p" /etc/openwrt_release 2>/dev/null | head -1 | tr '/' '-')
-  [ -n "$rel" ] && [ -n "$tgt" ] || return 1
-  printf 'openwrt-%s-%s-generic-%s-combined-efi.img.gz' "$rel" "$tgt" "$1"
-}
-
-# 下载固件($1 = ext4|squashfs)
-download_firmware() {
-  name=$(fw_asset_name "$1") || {
-    log_err "$(zh_en '读不到 /etc/openwrt_release, 拼不出下载文件名' \
-                      'Cannot read /etc/openwrt_release, cannot build the file name')"
-    return 1
-  }
-  url="${FW_DL_BASE}/${name}"
-  dst="/tmp/${name}"
-  log_info "$(zh_en "下载 $name (约 35 MB)..." "Downloading $name (~35 MB)...")"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fL --connect-timeout 15 -o "$dst" "$url" || {
-      log_err "$(zh_en '下载失败 —— 这台设备能上外网吗?' 'Download failed - does this device have internet?')"
-      return 1; }
-  elif command -v wget >/dev/null 2>&1; then
-    wget -O "$dst" "$url" || {
-      log_err "$(zh_en '下载失败 —— 这台设备能上外网吗?' 'Download failed - does this device have internet?')"
-      return 1; }
-  else
-    log_err "$(zh_en '固件里没有 curl/wget, 没法下载' 'No curl/wget in the firmware, cannot download')"
-    return 1
-  fi
-  if [ -s "$dst" ]; then
-    FW=$dst
-    log_info "$(zh_en "已下载: $FW" "Downloaded: $FW")"
-    return 0
-  fi
-  return 1
-}
-
-# 找不到固件时: 全盘扫一遍让用户挑 -> 问路径 -> 提议直接下载 -> 最后给说明
-fw_not_found_fallback() {
-  log_err "$(zh_en '未找到固件镜像 *combined-efi*.img.gz!' 'Firmware image *combined-efi*.img.gz not found!')"
-  log_warn "$(zh_en "已查找: $FW_SEARCH_DIRS 当前目录, 以及所有 USB 分区(自动挂载尝试过)" \
-                    "Searched: $FW_SEARCH_DIRS the current directory, and every USB partition (auto-mount attempted)")"
-
-  # 没有终端(--no-menu/脚本里跑): 只给可照抄的命令, 不提问
-  if [ ! -t 0 ] && [ ! -t 1 ]; then
-    log_warn "$(zh_en '如果是用 U 盘启动的, 可以不走镜像文件, 直接克隆当前介质:' \
-                      'If you booted from USB, you can clone the running medium instead:')"
-    log_warn "  openwrt-install --no-menu --clone"
-    name=$(fw_asset_name ext4 2>/dev/null || true)
-    [ -n "$name" ] || name='openwrt-<版本>-x86-64-generic-ext4-combined-efi.img.gz'
-    log_warn "$(zh_en '或者先准备镜像, 例如在这台设备上直接下载:' 'Or prepare an image, e.g. download it here:')"
-    log_warn "  curl -L -o /root/${name} ${FW_DL_BASE}/${name}"
-    log_warn "$(zh_en '然后带上路径重跑: openwrt-install --no-menu --fw /root/<上面那个文件名>' \
-                      'then re-run: openwrt-install --no-menu --fw /root/<the file above>')"
-    return 1
-  fi
-
-  # (0) 首选: 离线克隆(不需要镜像文件, 不需要网络) —— 从 U 盘启动时这一步就够了
-  if [ -z "$FORCE_CLONE" ]; then
-    if clone_offer; then
-      return 0
-    fi
-  fi
-
-  # (1) 全盘扫一遍, 列出候选让用户挑(带编号), 也允许直接输完整路径
-  CANDS=$(scan_firmware_anywhere)
-  if [ -n "$CANDS" ]; then
-    CF=$(mktemp 2>/dev/null || echo /tmp/.ofwlist.$$)
-    printf '%s\n' "$CANDS" | awk '{printf "%3d) %s\n", NR, $0}' > "$CF"
-    if [ -n "$HAS_WT" ]; then
-      whiptail --title "$(zh_en '系统里找到这些镜像' 'Images found on this system')" --textbox "$CF" 20 76
-    else
-      cat "$CF"
-    fi
-    SELFW=$(input_box "$(zh_en '选择固件' 'Select firmware')" \
-      "$(zh_en '输入上面列表里的编号, 或直接输入完整路径:' \
-                 'Enter a number from the list above, or a full path:')" "") || SELFW=""
-    rm -f "$CF"
-    # 纯数字 = 选编号; 其它 = 当路径/目录
-    case "$SELFW" in
-      ''|*[!0-9]*) ;;
-      *)
-        SELFW=$(printf '%s\n' "$CANDS" | sed -n "${SELFW}p")
-        ;;
-    esac
-    if [ -n "$SELFW" ]; then
-      f=$(fw_resolve_value "$SELFW")
-      if [ -n "$f" ]; then
-        FW=$f
-        log_info "$(zh_en "使用固件: $FW" "Using firmware: $FW")"
-        return 0
-      fi
-      log_warn "$(zh_en "$SELFW 不是可用的镜像文件" "$SELFW is not a usable image file")"
-    fi
-  fi
-
-  # (2) 还没有? 提议直接下载(需要设备能上网)
-  if confirm "$(zh_en '下载固件' 'Download firmware')" \
-     "$(zh_en '系统里没有镜像文件。\n\n现在从 GitHub 下载一份吗?\n(约 35 MB, 需要设备能上网; 下载到 /tmp)' \
-                'No image file on this system.\n\nDownload one from GitHub now?\n(~35 MB, needs internet; saved to /tmp)')"; then
-    if confirm "$(zh_en '选择版本' 'Choose variant')" \
-       "$(zh_en '要可写的 ext4 版吗?\n\n是 = ext4(推荐, 可扩容)\n否 = squashfs(只读, 抗写坏)' \
-                  'Use the writable ext4 variant?\n\nYes = ext4 (recommended, resizable)\nNo = squashfs (read-only, crash-safe)')"; then
-      VAR=ext4
-    else
-      VAR=squashfs
-    fi
-    download_firmware "$VAR" && return 0
-  fi
-
-  # (3) 都不行: 用对话框把怎么准备镜像讲清楚(而不是只丢一行 error)
-  msg "$(zh_en '需要固件镜像' 'Firmware image required')" \
-    "$(zh_en '安装器只负责把镜像写到盘上, 它里面不含固件。\n\n三种准备方式:\n  1) 在设备上直接下载(需要联网):\n       curl -L -o /root/openwrt.img.gz <Release 里的 img.gz 地址>\n  2) 从电脑拷进来(SSH/scp):\n       scp openwrt-*-combined-efi.img.gz root@<设备IP>:/root/\n  3) 虚拟机: 把 img.gz 做成 ISO 挂到光驱, 或配好端口转发再 scp\n\n放好后再选"安装", 或直接指定路径:\n  openwrt-install --no-menu --fw /root/openwrt-*.img.gz' \
-               'The installer only writes an image to a disk; it does not contain firmware.\n\nThree ways to get one:\n  1) Download on the device (needs internet):\n       curl -L -o /root/openwrt.img.gz <img.gz URL from the Release>\n  2) Copy it in over SSH/scp:\n       scp openwrt-*-combined-efi.img.gz root@<device-ip>:/root/\n  3) VM: put the img.gz into an ISO and attach it, or set up port forwarding and scp\n\nThen pick "install" again, or name the file directly:\n  openwrt-install --no-menu --fw /root/openwrt-*.img.gz')"
-  return 1
-}
-
 # 目标盘容量是否装得下(未压缩)镜像。
 # 虚拟机里挂一块比镜像小的空盘时, 原先只会得到 dd 的
 # "No space left on device", 完全看不出是盘太小。
@@ -604,19 +416,22 @@ image_raw_size() {   # 未压缩镜像大小(字节), 非 gzip 则用文件本�
 }
 
 # ---------------------------------------------------------------------------
-# 离线"克隆安装": 把当前正在运行的介质(U 盘)整盘复制到目标盘
+# ---------------------------------------------------------------------------
+# 安装方式: 克隆当前运行的介质(唯一默认路径)
 #
-# 为什么需要它: 我们用 dd 写出来的启动 U 盘里**只有系统本身, 没有 .img.gz 文件**
-# (ESP 才 16 MiB 装不下, rootfs 是只读 squashfs 也放不下), 所以原来只能
-# "先找到镜像文件, 找不到就联网下载"。而瘦客户机/路由器这种场景经常没有网络 ——
-# 于是根本装不了。
+# 用 dd 写出来的启动介质里**只有系统本身, 没有 .img.gz 文件**(ESP 才 16 MiB
+# 装不下 35 MB 的镜像; rootfs 是只读 squashfs 也放不下), 而刷机时机器通常
+# 根本没有网络 —— 所以"搜镜像文件 / 联网下载"这两条路都没有意义:
+# 直接把当前运行的这套系统整盘复制到目标盘就行。
 #
-# iStoreOS 的 quickstart "Install X86" 就是这么干的(源码 istoreos/quickstart
-# backend/cmd/backend/prompt.go): 直接把它自己运行的那块盘 dd 到目标盘,
-# 既不需要镜像文件也不需要网络。这里做同样的事。
+# (iStoreOS 的 quickstart "Install X86" 也是这么做的: 源码 istoreos/quickstart
+#  的 backend/cmd/backend/prompt.go 里直接 dd 自己运行的那块盘。)
 #
-# 拷贝长度只到"最后一个分区的末尾 + 备份 GPT", 而不是整块 U 盘(32G 的 U 盘
-# 不会傻copy 32G), 目标盘只要比这个长度大就行。
+# 只有显式给了镜像路径(--fw /path/xxx.img.gz, 或把它作为最后一个参数)时,
+# 才走"写镜像文件"这条路。
+#
+# 拷贝长度只到"最后一个分区的末尾 + 备份 GPT", 而不是整块介质
+# (32G 的 U 盘不会傻拷 32G), 目标盘只要比这个长度大就行。
 clone_src_disk() {   # 输出当前运行介质的整盘名(如 sda)
   d=$(first_word $BOOT_DISKS)
   [ -n "$d" ] || d=$(find_boot_disks 2>/dev/null | awk '{print $1}')
@@ -670,25 +485,13 @@ clone_resolve() {
   return 0
 }
 
-# 非交互路径(--clone): 直接准备好
+# 准备克隆(现在是唯一的安装路径): 算出源盘与复制长度并置位
 clone_prepare() {
   clone_resolve || return 1
   CLONE=1
   log_info "$(zh_en "离线克隆: $CLONE_SRC_PATH -> $TARGET (复制 $(bytes_to_mib "$CLONE_BYTES") MiB)" \
                     "Offline clone: $CLONE_SRC_PATH -> $TARGET (copying $(bytes_to_mib "$CLONE_BYTES") MiB)")"
   return 0
-}
-
-# 交互路径: 问用户要不要用离线克隆(找不到镜像文件时的首选)
-clone_offer() {
-  clone_resolve || return 1
-  if confirm "$(zh_en '离线克隆安装' 'Offline clone install')" \
-     "$(zh_en "这台设备上没找到固件镜像文件, 但你现在是从 U 盘启动的 ——\n可以直接把当前这套系统整盘复制到目标盘, **不需要镜像文件, 也不需要联网**。\n\n源盘  : $CLONE_SRC_PATH\n目标盘: $TARGET\n复制  : $(bytes_to_mib "$CLONE_BYTES") MiB (会清空目标盘)\n\n用这个方法安装吗?" \
-                "No image file was found, but you booted from USB -\nthe running system can be cloned to the target disk.\n**No image file and no network needed.**\n\nFrom: $CLONE_SRC_PATH\nTo:   $TARGET\nCopy: $(bytes_to_mib "$CLONE_BYTES") MiB (target will be erased)\n\nUse this method?")"; then
-    CLONE=1
-    return 0
-  fi
-  return 1
 }
 
 check_target_size() {
@@ -1191,12 +994,14 @@ show_diag() {
   echo "-- $(zh_en '挂载点' 'mounts (/, /rom, /overlay, usb)') --"
   awk '$2=="/"||$2=="/rom"||$2=="/overlay"||$3=="vfat"||$3=="exfat"||$3=="ntfs"{print "  "$2"  "$1"  "$3}' /proc/mounts 2>/dev/null | head -10
   echo
-  echo "-- $(zh_en '固件镜像搜索' 'firmware image search') --"
-  for mnt in /mnt /media /boot /mnt/usb; do
-    [ -d "$mnt" ] || continue
-    hit=$(find "$mnt" -maxdepth 3 -name '*combined-efi*.img.gz' 2>/dev/null | head -3 | tr '\n' ' ')
-    echo "  $mnt: ${hit:-$(zh_en '无' 'none')}"
-  done
+  echo "-- $(zh_en '克隆安装的源盘' 'clone install source') --"
+  cs=$(clone_src_disk 2>/dev/null || true)
+  if [ -n "$cs" ]; then
+    cb=$(clone_src_bytes "/dev/$cs" 2>/dev/null || true)
+    echo "  $(zh_en '源盘' 'source'): /dev/$cs   $(zh_en '需要复制' 'copy') ${cb:-?} $(zh_en '字节' 'bytes')"
+  else
+    echo "  $(zh_en '认不出当前启动介质, 无法克隆安装' 'cannot identify the running medium, clone install unavailable')"
+  fi
   echo
   echo "-- $(zh_en '工具' 'tools') --"
   for t in whiptail sfdisk resize2fs e2fsck gunzip dd mount umount partx mkfs.ext4; do
@@ -1215,7 +1020,7 @@ text_menu() {
     cat <<EOF
 
 ======== $(zh_en 'OpenWrt 安装助手' 'OpenWrt Installer') ========$(ui_note)
-  1) $(zh_en '安装系统到内置硬盘 (会清空目标盘!)' 'Install to internal disk (ERASES the target disk!)')
+  1) $(zh_en '安装系统到内置硬盘 (克隆当前系统, 会清空目标盘!)' 'Install to internal disk (clones the running system, ERASES it!)')
   2) $(zh_en '查看磁盘与空间状态' 'Show disks and space status')
   3) $(zh_en '修改 LAN 口 IP 地址' 'Change LAN IP address')
   4) $(zh_en '修改 root 密码' 'Change root password')
@@ -1223,7 +1028,6 @@ text_menu() {
   6) $(zh_en '显示扩容命令(如需要)' 'Show resize commands (if needed)')
   7) $(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')
   8) $(zh_en '诊断(装不上时先看这个)' 'Diagnose (run this when install fails)')
-  9) $(zh_en '克隆安装(从当前介质, 不需要镜像/网络)' 'Clone install (from running medium, no image/network)')
   0) $(zh_en '退出 (输入 q 也可以)' 'Quit (or type q)')
 ========================================
 EOF
@@ -1263,12 +1067,6 @@ EOF
         printf '%s' "$(zh_en '按回车继续...' 'Press Enter to continue...')"
         read -r _x || true
         ;;
-      9)
-        OLD_FC=$FORCE_CLONE
-        FORCE_CLONE=1
-        do_install || true
-        FORCE_CLONE=$OLD_FC
-        ;;
       0|q|Q|quit|QUIT|exit|EXIT|"") echo "$(zh_en '已退出' 'Bye')"; return 0 ;;
       *) echo "$(zh_en "无效编号: $N" "Invalid input: $N")" ;;
     esac
@@ -1282,7 +1080,7 @@ main_menu() {
     CHOICE=$(whiptail --title "$(zh_en 'OpenWrt 安装助手' 'OpenWrt Installer')" \
       --cancel-button "$(zh_en '退出' 'Quit')" --menu \
       "$(zh_en '请选择要执行的操作 (Esc=退出):' 'Select an action (Esc = quit):')$(ui_note)" 22 76 9 \
-      "1" "$(zh_en '安装系统到内置硬盘 (会清空目标盘!)' 'Install to internal disk (ERASES the target disk!)')" \
+      "1" "$(zh_en '安装系统到内置硬盘 (克隆当前系统, 会清空目标盘!)' 'Install to internal disk (clones the running system, ERASES it!)')" \
       "2" "$(zh_en '查看磁盘与空间状态' 'Show disks and space status')" \
       "3" "$(zh_en '修改 LAN 口 IP 地址' 'Change LAN IP address')" \
       "4" "$(zh_en '修改 root 密码' 'Change root password')" \
@@ -1290,7 +1088,6 @@ main_menu() {
       "6" "$(zh_en '显示扩容命令(如需要)' 'Show resize commands (if needed)')" \
       "7" "$(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')" \
       "8" "$(zh_en '诊断(装不上时先看这个)' 'Diagnose (run this when install fails)')" \
-      "9" "$(zh_en '克隆安装(从当前介质, 不需要镜像/网络)' 'Clone install (from running medium, no image/network)')" \
       "0" "$(zh_en '退出' 'Quit')" \
       3>&1 1>&2 2>&3) || return 0
     case "$CHOICE" in
@@ -1352,13 +1149,6 @@ main_menu() {
         rm -f "$TMPF"
         msg "$(zh_en '诊断信息' 'Diagnostics')" "${TXT:-$(zh_en '未获取到信息' 'no information')}"
         ;;
-      9)
-        # 克隆安装: 直接把当前介质整盘复制到目标盘(不需要镜像文件/网络)
-        OLD_FC=$FORCE_CLONE
-        FORCE_CLONE=1
-        do_install || true
-        FORCE_CLONE=$OLD_FC
-        ;;
       0|q|Q|quit|"") return 0 ;;
     esac
   done
@@ -1371,11 +1161,18 @@ do_install() {
   FW_PATH=$1
   CLONE=""
   find_target_disk || return 1
-  if [ "$FORCE_CLONE" = "1" ]; then
-    # --clone / 菜单里选"克隆安装": 不走镜像文件
-    clone_prepare || return 1
+  # 默认且唯一的安装路径: 克隆当前运行的介质。不再搜索镜像文件、也不提供下载。
+  # 只有显式给了镜像路径时才写镜像文件(留给特殊场景, 例如在 VM 里写指定的 img.gz)。
+  if [ -n "$FW_PATH" ]; then
+    if [ -f "$FW_PATH" ]; then
+      FW=$FW_PATH
+      log_info "$(zh_en "使用指定的镜像文件: $FW" "Using the given image file: $FW")"
+    else
+      log_err "$(zh_en "指定的镜像文件不存在: $FW_PATH" "Given image file does not exist: $FW_PATH")"
+      return 1
+    fi
   else
-    find_firmware "$FW_PATH" || return 1
+    clone_prepare || return 1
   fi
   check_target_size || return 1
   countdown
@@ -1429,17 +1226,15 @@ Usage: openwrt-install [options] [firmware.img.gz]
   (no args)        interactive menu (recommended)
   --no-menu        skip the menu, install straight to the internal disk
   --change-ip      only change the LAN IP
-  --clone          install by cloning the running medium (the USB stick you
-                   booted from) onto the target disk - no firmware image file
-                   and no network needed (same as menu item 9)
-  --diag           print diagnostics (disks, boot disk, candidates, firmware
-                   search, tools) - run this when an install fails
+  --clone          kept for compatibility: cloning the running medium is now
+                   the default install method, with or without this flag
+  --diag           print diagnostics (disks, boot disk, candidates, clone
+                   source, tools) - run this when an install fails
   --disk <dev>     target disk, e.g. --disk /dev/sdb
                    (required when several disks exist and there is no terminal;
                     OPENWRT_TARGET_DISK=/dev/sdb works too)
-  --fw <path>      firmware image, e.g. --fw /root/openwrt-*.img.gz
-                   (same as passing it as the last argument; searched by default
-                    in /mnt /media /boot /root /home /tmp /var/tmp /opt and ".")
+  --fw <path>      (optional) write this image file instead of cloning, e.g.
+                   --fw /root/openwrt-*.img.gz (same as the last argument)
   --en / --zh      English (pure ASCII) / Chinese menu; same as OPENWRT_UI=en|zh
                    Use --en when the terminal cannot show Chinese (local console
                    without CJK glyphs, or a GBK SSH client). TERM=linux/dumb/empty
@@ -1456,7 +1251,6 @@ Target disk rules:
 Examples:
   openwrt-install
   openwrt-install --en
-  openwrt-install --clone
   openwrt-install --diag
   openwrt-install --no-menu
   openwrt-install --no-menu /mnt/sda1/openwrt-*.img.gz
@@ -1471,15 +1265,13 @@ EOF
   (无参数)        显示交互式菜单 (推荐)
   --no-menu       跳过菜单, 直接安装到内置硬盘(原一键安装行为)
   --change-ip     直接进入"修改 LAN 口 IP"功能(对应 quickstart 的改 IP)
-  --clone         克隆安装: 把当前运行的介质(你启动用的 U 盘)整盘复制到目标盘
-                  —— 不需要固件镜像文件, 也不需要联网(等价于菜单里的第 9 项)
-  --diag          打印诊断信息(磁盘/启动盘/候选判定/固件搜索/工具), 装不上时先跑这个
+  --clone         兼容写法: 现在"克隆安装"就是默认行为, 加不加都一样
+  --diag          打印诊断信息(磁盘/启动盘/候选判定/克隆源/工具), 装不上时先跑这个
   --disk <设备>   指定目标盘, 例如 --disk /dev/sdb
                   (多块盘且非交互环境下**必须**用它; 也接受
                    OPENWRT_TARGET_DISK=/dev/sdb 环境变量)
-  --fw <路径>     指定固件镜像, 例如 --fw /root/openwrt-*.img.gz
-                  (等价于把它作为最后一个参数; 默认会搜 /mnt /media /boot
-                   /root /home /tmp /var/tmp /opt 和当前目录)
+  --fw <路径>     (可选) 不克隆, 改为写指定的镜像文件, 例如 --fw /root/openwrt-*.img.gz
+                  等价于把它作为最后一个参数; 平时不需要用
   --en / --zh     菜单用英文(纯 ASCII) / 中文; 等价于 OPENWRT_UI=en|zh
                   终端显示不了中文时(本机控制台没中文字形、或 SSH 客户端
                   用 GBK)用 --en; 本机控制台(TERM=linux)会自动选英文。
@@ -1495,7 +1287,6 @@ EOF
 示例:
   openwrt-install                                  # 菜单模式
   openwrt-install --en                             # 英文菜单(终端不支持中文时)
-  openwrt-install --clone
   openwrt-install --clone                          # 离线克隆安装(无镜像/无网络)
   openwrt-install --diag                           # 诊断, 看为什么装不上
   openwrt-install --no-menu                        # 一键安装(自动找固件/目标盘)
@@ -1521,7 +1312,7 @@ main() {
       --no-menu) MODE=install ;;
       --change-ip) MODE=changeip ;;
       --diag|--check) MODE=diag ;;
-      --clone) MODE=install; FORCE_CLONE=1 ;;
+      --clone) MODE=install ;;   # 兼容旧写法: 现在默认就是克隆
       --en|--english) UI_FORCE=en ;;
       --zh|--chinese) UI_FORCE=zh ;;
       --disk)
