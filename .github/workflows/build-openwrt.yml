@@ -164,6 +164,26 @@ jobs:
           curl -fSL -o "${PKGDIR}/luci-app-oaf-${OAF_LUCI_VER}.apk" \
             "https://github.com/destan19/OpenAppFilter/releases/download/${OAF_TAG}/luci-app-oaf-${OAF_LUCI_VER}.apk"
 
+          # OAF 中文语言包 —— 缺它 LuCI 里的 OAF 页面就全是英文
+          # 坑: 上游把版本号从资产文件名里删掉了(luci-i18n-oaf-zh-cn.apk), 而
+          # ImageBuilder 要求本地 apk 文件名必须是 <包名>-<版本>.apk。名字对不上时
+          # 建索引会注册 "<包名>-<真实版本>" 却找不到文件, 装的时候才报
+          #   ERROR: package mentioned in index not found
+          # 它的版本是 LuCI 风格的日期版本(如 26.238.31834~15b2b27), 跟 app 的
+          # 7.0-r1 不是一回事, 不能照抄, 所以直接从 apk 容器里读出真实版本再改名。
+          # (apk v3 容器: 偏移 4 起是 "ADB.pckg" 段的 raw-deflate 数据, 解出来就是
+          #  "包名 版本 @描述" 这样的元数据文本)
+          I18N_APK="$(mktemp -d)/luci-i18n-oaf-zh-cn.apk"
+          curl -fSL -o "$I18N_APK" \
+            "https://github.com/destan19/OpenAppFilter/releases/download/${OAF_TAG}/luci-i18n-oaf-zh-cn.apk"
+          I18N_VER=$(python3 -c "import re,sys,zlib;d=open(sys.argv[1],'rb').read();t=zlib.decompressobj(-15).decompress(d[4:]).decode('utf-8','replace');m=re.search(r'luci-i18n-oaf-zh-cn[\x00-\x20]+([0-9][^\s@]*)',t);print(m.group(1) if m else '')" "$I18N_APK" 2>/dev/null || true)
+          if [ -z "$I18N_VER" ]; then
+            echo "::error::读不出 luci-i18n-oaf-zh-cn 的版本号(上游 apk 容器格式变了?), 不能瞎猜文件名"
+            exit 1
+          fi
+          echo "==> OAF 中文语言包版本: ${I18N_VER}"
+          cp "$I18N_APK" "${PKGDIR}/luci-i18n-oaf-zh-cn-${I18N_VER}.apk"
+
           # 重要: 本地 apk 文件名必须是 <name>-<version>.apk, 且 version 要与包内元数据
           # 一致。若文件名缺少版本(例如 luci-app-oaf.apk), ImageBuilder 建索引时会注册
           # "luci-app-oaf-7.0-r1" 却找不到对应文件, 安装时报:
@@ -179,10 +199,11 @@ jobs:
           mapfile -t PKGS < <(grep -vE '^[[:space:]]*(#|$)' scripts/packages.list)
           # 来源2: 从第三方 release 拉取的预编译包(它们不在 packages.list 里!)
           #   kmod-oaf / appfilter 来自 OAF 的 per-target tar.gz
-          #   luci-app-oaf / luci-app-openclash 来自各自 release 的 .apk
+          #   luci-app-oaf / luci-i18n-oaf-zh-cn / luci-app-openclash 来自各自 release 的 .apk
           # 注意: 这几行曾遗漏, 导致插件被静默丢弃(固件 255 个包而非 285 个),
           # 下面的自检就是为了防止再次遗漏。
-          PKGS+=(kmod-oaf appfilter luci-app-oaf luci-app-openclash)
+          # luci-i18n-oaf-zh-cn 是 OAF 的中文界面翻译包, 漏了它 OAF 页面全英文。
+          PKGS+=(kmod-oaf appfilter luci-app-oaf luci-i18n-oaf-zh-cn luci-app-openclash)
           printf '%s\n' "${PKGS[@]}" > /tmp/pkgs.txt
           echo "==> 共 ${#PKGS[@]} 个包:"
           printf '  %s\n' "${PKGS[@]}"
