@@ -449,3 +449,20 @@ config mount
 
 > 这两个组件都不是"从源码编译"的：主题是纯静态文件，DDNS-GO 是上游发布的静态二进制，
 > 所以 ImageBuilder 就够用，不需要 SDK 编译环境。
+
+### 磁盘管理（网页里扩容 / 建分区 / 挂载）
+
+菜单：**系统 → 磁盘管理**。后端是 `/usr/bin/openwrt-storage`（同一个脚本也能在 SSH 里直接用）。
+
+| 页面上的操作 | 等价命令 | 说明 |
+|---|---|---|
+| 扩容根分区 | `openwrt-storage grow` | 把根分区扩到盘尾 + **在线** `resize2fs`（不用重启）。只有 ext4 版能这样扩；根分区后面若已有别的分区会自动停在它前面 |
+| 新建数据分区 | `openwrt-storage newpart --disk /dev/mmcblk1 --size all --fs ext4 --mount /mnt/data` | 在**未分配空间**建分区 → `mkfs.ext4`/`mkfs.vfat` → 写入 `/etc/config/fstab` 开机自动挂载 |
+| 挂载已有分区 | `openwrt-storage mount /dev/sdb1 [--target /mnt/x] [--no-fstab]` | 按 UUID 写 fstab（比设备名稳），并立即挂载 |
+| 卸载 | `openwrt-storage umount /mnt/data` | 卸载并取消开机自动挂载 |
+| 总览 | `openwrt-storage list` | 磁盘/分区/文件系统/挂载/已用/**未分配空间** |
+
+- 页面只调用这个脚本并显示原始输出，所以出问题时**照着输出就能判断**，也能 SSH 复现
+- 分区操作用 `sfdisk`，格式化用 `e2fsprogs`/`dosfstools`，挂载持久化用 `block-mount`
+- 新建分区只挑"未分配空间"，**不会动已有分区**；扩容也自动避开后面的分区
+- 依赖已进镜像：`e2fsprogs`、`dosfstools`（`mkfs.vfat`）、`sfdisk`、`resize2fs`、`block-mount`

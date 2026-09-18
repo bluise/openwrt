@@ -80,3 +80,9 @@ wget-ssl
 # LuCI 25.x 把 Lua 运行时与兼容层单独分包, 缺了它们这个页面会 500。
 luci-compat
 luci-lua-runtime
+
+# ---- 磁盘管理页面(系统 -> 磁盘管理 / openwrt-storage)所需 ----
+# sfdisk / resize2fs / e2fsprogs 已在上面或由 base 提供; 这里补:
+e2fsprogs
+# mkfs.vfat: 建 FAT32 数据分区/U盘时用(自带固件里没有 mkfs.vfat)
+dosfstools

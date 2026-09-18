@@ -304,6 +304,21 @@ jobs:
           done
           echo "==> openwrt-install 自检通过: 语法 OK, 关键函数齐备"
 
+          # 磁盘管理: shell 后端 + LuCI 页面(系统 -> 磁盘管理)
+          sh -n files/usr/bin/openwrt-storage
+          for f in files/usr/bin/openwrt-storage \
+                   files/usr/lib/lua/luci/controller/disktool.lua \
+                   files/usr/lib/lua/luci/view/disktool.htm \
+                   files/usr/share/rpcd/acl.d/luci-app-disktool.json; do
+            [ -f "$f" ] || { echo "::error::缺少文件: $f"; exit 1; }
+          done
+          # 每个子命令都要有对应实现(cmd_list / cmd_grow / ...)
+          for c in list grow newpart mount umount; do
+            grep -qE "^cmd_$c\\(\\)" files/usr/bin/openwrt-storage || {
+              echo "::error::openwrt-storage 缺少子命令实现: cmd_$c"; exit 1; }
+          done
+          echo "==> 磁盘管理自检通过(shell + LuCI 页面文件齐备)"
+
       - name: Stage Argon theme (iStoreOS 风格主题)
         if: steps.release.outputs.build == 'true'
         run: |

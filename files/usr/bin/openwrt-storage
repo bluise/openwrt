@@ -1,0 +1,479 @@
+#!/bin/sh
+# =============================================
+# openwrt-storage : 硬盘/分区管理(命令行 + LuCI 页面后端)
+#
+#   openwrt-storage list                 # 总览: 磁盘/分区/文件系统/挂载/未分配空间
+#   openwrt-storage grow                 # 把 rootfs 分区扩到整盘末尾, 并在线扩容文件系统
+#   openwrt-storage newpart --disk /dev/mmcblk1 [--size all|MiB] [--fs ext4|vfat]
+#                           [--mount /mnt/data] [--label data]
+#                                        # 在未分配空间建分区 + 格式化 + 开机自动挂载
+#   openwrt-storage mount /dev/sdb1 [--target /mnt/xxx] [--no-fstab]
+#   openwrt-storage umount /mnt/data
+#
+# LuCI 页面(系统 -> 磁盘管理)就是调这几个子命令并显示输出, 所以这里也能直接 SSH 用。
+#
+# 依赖(镜像里都有): sfdisk、e2fsprogs(mkfs.ext4/e2fsck/resize2fs)、
+#                   dosfstools(mkfs.vfat)、block-mount(fstab)、partx、jsonfilter
+# =============================================
+
+set -e
+
+INFO() { printf '%s\n' "$*"; }
+OK()   { printf '  ✅ %s\n' "$*"; }
+WARN() { printf '  ⚠️  %s\n' "$*"; }
+ERR()  { printf '  ❌ %s\n' "$*" >&2; }
+DIE()  { ERR "$*"; exit 1; }
+
+SECTOR=512
+
+# ---------- 小工具 ----------
+first_word() { set -- $1; echo "${1:-}"; }
+mb() { echo $(( ($1 + 1048575) / 1048576 )); }          # 字节 -> MiB(向上取整)
+part_suffix() { s=$1; s=${s##*[!0-9]}; echo "$s"; }
+disk_sectors() {
+  n=$(basename "$1")
+  if [ -r "/sys/class/block/$n/size" ]; then
+    cat "/sys/class/block/$n/size"; return
+  fi
+  sz=$(wc -c < "$1" 2>/dev/null | tr -d ' ')
+  [ -n "$sz" ] && [ "$sz" -gt 0 ] 2>/dev/null && echo $(( sz / SECTOR ))
+}
+
+# 是不是"整块盘"(排除 loop/ram/zram/dm/md/sr/nbd 与 eMMC 的 boot0/boot1/rpmb 硬件区)
+is_whole_disk() {
+  n=$1
+  case "$n" in loop*|ram*|zram*|dm-*|md*|sr*|fd*|nbd*|*boot0|*boot1|*rpmb) return 1 ;; esac
+  [ -f "/sys/class/block/$n/partition" ] && return 1
+  [ -r "/sys/class/block/$n/size" ] || return 1
+  return 0
+}
+
+list_disks() {
+  for d in /sys/class/block/*; do
+    n=$(basename "$d")
+    is_whole_disk "$n" && echo "$n"
+  done
+}
+
+disk_desc() {
+  n=$1
+  sec=$(cat "/sys/class/block/$n/size" 2>/dev/null || echo 0)
+  mib=$(( sec / 2048 ))
+  if [ "$mib" -ge 1024 ]; then human="$(( mib / 1024 )).$(( (mib % 1024) * 10 / 1024 )) GiB"
+  else human="$mib MiB"; fi
+  model=$(cat "/sys/class/block/$n/device/model" 2>/dev/null | tr -s ' ' | sed 's/ *$//')
+  case "$(readlink -f "/sys/class/block/$n" 2>/dev/null)" in
+    */usb[0-9]*) bus="USB" ;;
+    *mmc*)       bus="eMMC/SD" ;;
+    *nvme*)      bus="NVMe" ;;
+    *ata*|*ahci*) bus="SATA" ;;
+    *)           bus="-" ;;
+  esac
+  printf '%s %s%s' "$human" "$bus" "${model:+  $model}"
+}
+
+# 分区表: 每行 "<设备> <start> <size> <type> <uuid> <attrs|-> <名字>"
+part_table() {
+  sfdisk -d "$1" 2>/dev/null | awk '
+    /^[^ ]*[0-9] *:/ {
+      line = $0
+      dev = line; sub(/ *:.*$/, "", dev)
+      rest = substr(line, index(line, ":") + 1)
+      start=""; size=""; type=""; uuid=""; name=""; attrs=""
+      while (match(rest, /[a-z-]+=/)) {
+        key = substr(rest, RSTART, RLENGTH - 1)
+        rest = substr(rest, RSTART + RLENGTH)
+        if (substr(rest,1,1) == "\"") { q = index(substr(rest,2), "\""); val = substr(rest,2,q-1); rest = substr(rest,q+2) }
+        else { c = index(rest, ","); if (c == 0) { val = rest; rest = "" } else { val = substr(rest,1,c-1); rest = substr(rest,c+1) } }
+        gsub(/^[ \t]+|[ \t]+$/, "", val)
+        if (key=="start") start=val; else if (key=="size") size=val
+        else if (key=="type") type=val; else if (key=="uuid") uuid=val
+        else if (key=="name") name=val; else if (key=="attrs") attrs=val
+      }
+      if (start != "" && size != "" && start + 0 > 0)
+        printf "%s %s %s %s %s %s %s\n", dev, start, size, type, uuid, (attrs==""?"-":attrs), (name==""?"-":name)
+    }'
+}
+
+# 文件系统类型(按魔数, 不依赖 blkid): $1=设备 $2=起始字节偏移
+fs_type_at() {
+  m=$(od -An -tx1 -j "$2" -N 4 "$1" 2>/dev/null | tr -d ' \n')
+  case "$m" in 68737173) echo squashfs; return ;; esac
+  m2=$(od -An -tx1 -j $(( $2 + 1080 )) -N 2 "$1" 2>/dev/null | tr -d ' \n')
+  case "$m2" in 53ef) echo ext4; return ;; esac
+  m3=$(od -An -tx2 -j $(( $2 + 82 )) -N 2 "$1" 2>/dev/null | tr -d ' \n')
+  case "$m3" in 4146|4641) echo vfat; return ;; esac   # "FA"/"AF" 附近
+  # FAT 用 0x1FE 的 55AA + OEM 名判断
+  m4=$(od -An -tx1 -j $(( $2 + 54 )) -N 8 "$1" 2>/dev/null | tr -d ' \n')
+  case "$m4" in 464154*|4d5344*|6d6b66*|6d73646f*|4e545246*|45584641*) echo vfat; return ;; esac
+  echo unknown
+}
+
+# 分区设备名: (mmcblk1, 2) -> mmcblk1p2 ; (sda, 2) -> sda2
+part_dev_name() {
+  d=$1; s=$2
+  if [ -f "/sys/class/block/${d}p${s}" ]; then echo "${d}p${s}"; else echo "${d}${s}"; fi
+}
+# 带 /dev/ 前缀的版本
+target_part_dev() { echo "/dev/$(part_dev_name "$1" "$2")"; }
+
+# 分区 -> 挂载点(走 mountinfo 的 major:minor, 避开 /dev/root 这类别名)
+part_mountpoint() {
+  want=$(basename "$1")
+  for mp in $(awk '{print $5}' /proc/self/mountinfo 2>/dev/null | sort -u); do
+    [ "$mp" = "/" ] || [ -d "$mp" ] || continue
+    mm=$(awk -v m="$mp" '$5 == m { print $3; exit }' /proc/self/mountinfo 2>/dev/null)
+    [ -n "$mm" ] || continue
+    n=$(basename "$(readlink -f "/sys/dev/block/$mm" 2>/dev/null)" 2>/dev/null)
+    [ "$n" = "$want" ] && { echo "$mp"; return; }
+  done
+  echo ""
+}
+
+# 当前根分区(整盘名 + 分区号)
+root_part() {
+  for mp in /rom /; do
+    mm=$(awk -v m="$mp" '$5 == m { print $3; exit }' /proc/self/mountinfo 2>/dev/null)
+    [ -n "$mm" ] || continue
+    n=$(basename "$(readlink -f "/sys/dev/block/$mm" 2>/dev/null)" 2>/dev/null)
+    [ -n "$n" ] || continue
+    # 分区名 -> 整盘名: mmcblk1p2/nvme0n1p1 去掉 pN; sda128 去掉尾部所有数字
+    case "$n" in
+      *p[0-9]*) disk=${n%p[0-9]*} ;;
+      *)        disk=$n
+                while :; do
+                  case "$disk" in *[0-9]) disk=${disk%[0-9]} ;; *) break ;; esac
+                done ;;
+    esac
+    echo "$disk $(part_suffix "$n")"
+    return 0
+  done
+  return 1
+}
+
+# 未分配空间(尾部第一段够大的空隙): 输出 "<起始扇区> <扇区数>"
+free_tail() {
+  dev=$1
+  total=$(disk_sectors "$dev")
+  [ -n "$total" ] || { echo ""; return 1; }
+  last=$(( total - 34 ))                     # 盘尾留给备份 GPT
+  maxend=$(part_table "$dev" | awk '{ e = $2 + $3; if (e > m) m = e } END { print m + 0 }')
+  [ "$maxend" -gt 0 ] 2>/dev/null || maxend=34
+  start=$(( maxend > 34 ? maxend : 34 ))
+  start=$(( (start + 2047) / 2048 * 2048 ))   # 按 1 MiB 对齐
+  [ "$start" -lt "$last" ] || { echo ""; return 1; }
+  echo "$start $(( last - start + 1 ))"
+}
+
+# =============================================
+# list : 总览
+# =============================================
+cmd_list() {
+  INFO "===== 磁盘与分区 ====="
+  rp=$(root_part 2>/dev/null || true)
+  for d in $(list_disks); do
+    INFO ""
+    INFO "■ /dev/$d   ($(disk_desc "$d"))"
+    if ! sfdisk -d "/dev/$d" >/dev/null 2>&1; then
+      WARN "读不出 /dev/$d 的分区表(sfdisk 失败: 需要 root 权限, 或设备不可读)"
+    fi
+    tbl=$(part_table "$d" 2>/dev/null || true)
+    if [ -z "$tbl" ]; then
+      INFO "    (没有分区表 / 未分区)"
+    else
+      INFO "    分区          大小        文件系统   挂载点              已用"
+      while read -r pdev pstart psize ptype puuid pattrs pname; do
+        [ -n "$pstart" ] || continue
+        psuf=$(part_suffix "$pdev")
+        pmib=$(mb $(( psize * SECTOR )))
+        pfs=$(fs_type_at "/dev/$d" $(( pstart * SECTOR )) 2>/dev/null || echo "?")
+        pmp=$(part_mountpoint "/dev/$(part_dev_name "$d" "$psuf")" 2>/dev/null || true)
+        used=""
+        [ -n "$pmp" ] && used=$(df -h "$pmp" 2>/dev/null | awk 'NR==2{print $5" ("$3"/"$2")"}')
+        printf '    %-13s %6s MiB  %-9s %-19s %s\n' \
+          "$(part_dev_name "$d" "$psuf")" "$pmib" "$pfs" "${pmp:-未挂载}" "$used"
+        :
+      done <<EOF
+$tbl
+EOF
+    fi
+    free=$(free_tail "$d" 2>/dev/null || true)
+    if [ -n "$free" ]; then
+      fs_start=$(first_word "$free"); fs_secs=$(echo "$free" | awk '{print $2}')
+      INFO "    未分配空间: $(mb $(( fs_secs * SECTOR ))) MiB  (从扇区 $fs_start 起)"
+    else
+      INFO "    未分配空间: 无"
+    fi
+    if [ -n "$rp" ]; then
+      rdisk=$(first_word "$rp"); rsuf=$(echo "$rp" | awk '{print $2}')
+      [ "$rdisk" = "$d" ] && INFO "    ← 当前系统运行在这块盘上(根分区 $(part_dev_name "$d" "$rsuf"))"
+    fi
+  done
+  INFO ""
+  INFO "===== 文件系统占用 ====="
+  df -h 2>/dev/null | grep -vE '^(tmpfs|devtmpfs)' | sed 's/^/  /'
+  INFO ""
+  INFO "提示:"
+  INFO "  openwrt-storage grow                    # 把根分区扩到整盘(在线, 不用重启)"
+  INFO "  openwrt-storage newpart --disk /dev/X --size all --fs ext4 --mount /mnt/data"
+  INFO "  openwrt-storage mount /dev/sdb1         # 挂载已有的分区并设为开机自动挂载"
+}
+
+# =============================================
+# grow : 根分区扩到整盘
+# =============================================
+cmd_grow() {
+  rp=$(root_part 2>/dev/null) || DIE "认不出当前根分区(不是从块设备启动?)"
+  rdisk=$(first_word "$rp"); rsuf=$(echo "$rp" | awk '{print $2}')
+  [ -n "$rdisk" ] && [ -n "$rsuf" ] || DIE "认不出当前根分区"
+  rdev=$(target_part_dev "$rdisk" "$rsuf")
+
+  tbl=$(part_table "$rdisk")
+  set -- $(echo "$tbl" | awk -v s="$rsuf" '{ n=$1; sub(/.*[^0-9]/,"",n); if (n==s) print $2, $3 }')
+  rstart=${1:-}; rsize=${2:-}
+  [ -n "$rstart" ] || DIE "分区表里找不到分区 $rsuf"
+  rfs=$(fs_type_at "/dev/$rdisk" $(( rstart * SECTOR )) 2>/dev/null || echo unknown)
+
+  total=$(disk_sectors "$rdisk")
+  last=$(( total - 34 ))
+  # 上限: 不能盖到根分区后面已有的分区(例如自建的数据分区), 否则会毁掉它
+  nextstart=$(part_table "$rdisk" | awk -v st="$rstart" '{ if ($2 + 0 > st + 0) { if (m == 0 || $2 + 0 < m) m = $2 + 0 } } END { print m + 0 }')
+  if [ "$nextstart" -gt 0 ] 2>/dev/null; then
+    last=$(( nextstart - 1 ))
+    WARN "根分区后面还有分区(起始扇区 $nextstart), 只扩到它前面"
+  fi
+  newsz=$(( last - rstart + 1 ))
+
+  INFO "根分区      : /dev/$rdisk → $rdev"
+  INFO "当前大小    : $(mb $(( rsize * SECTOR ))) MiB"
+  INFO "可扩到      : $(mb $(( newsz * SECTOR ))) MiB  ($([ "$newsz" -gt "$rsize" ] && echo "可增加 $(mb $(( (newsz - rsize) * SECTOR ))) MiB" || echo "已经是整盘"))"
+  INFO "文件系统    : $rfs"
+  if [ "$newsz" -le "$rsize" ] 2>/dev/null; then
+    OK "无需扩容(根分区已经占满整盘)"
+    return 0
+  fi
+  if [ "$rfs" != "ext4" ]; then
+    WARN "$rfs 根文件系统不能这样在线扩容(只有 ext4 可以)。"
+    WARN "squashfs 版请改用 ext4 版镜像, 或把新空间做成数据分区:"
+    WARN "  openwrt-storage newpart --disk /dev/$rdisk --size all --fs ext4 --mount /mnt/data"
+    return 1
+  fi
+
+  INFO ""
+  INFO "[1/3] 改分区表: 分区 $rsuf 扩到盘尾(起点 $rstart 不变)"
+  echo "start=$rstart, size=$newsz" | sfdisk --force --no-reread -N "$rsuf" "/dev/$rdisk"
+  INFO "[2/3] 让内核重读分区大小"
+  partx -u "/dev/$rdisk" 2>/dev/null || true
+  sleep 1
+  INFO "[3/3] 在线扩容 ext4 文件系统(运行中也安全)"
+  e2fsck -f -y "$rdev" >/dev/null 2>&1 || true        # 挂载中时 e2fsck 会拒绝, 忽略即可
+  resize2fs "$rdev" || { ERR "resize2fs 失败"; return 1; }
+  sync
+  OK "完成: $(df -h / | awk 'NR==2{print $2}') 现在可用于 /"
+  df -h / | sed 's/^/    /'
+}
+
+# =============================================
+# newpart : 在未分配空间建分区 + 格式化 + 挂载
+# =============================================
+cmd_newpart() {
+  disk=""; size="all"; fs="ext4"; target=""; label="data"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --disk) disk=$2; shift 2 ;;
+      --size) size=$2; shift 2 ;;
+      --fs)   fs=$2; shift 2 ;;
+      --mount) target=$2; shift 2 ;;
+      --label) label=$2; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$disk" ] || DIE "必须用 --disk 指定磁盘(如 --disk /dev/mmcblk1); 先跑 openwrt-storage list 看磁盘名"
+  d=$(basename "$disk")
+  is_whole_disk "$d" || DIE "$disk 不是整块磁盘"
+  [ -b "$disk" ] || DIE "$disk 不存在"
+
+  free=$(free_tail "$d" 2>/dev/null || true)
+  [ -n "$free" ] || DIE "/dev/$d 上没有可用的未分配空间(先跑 openwrt-storage list 看看)"
+  fstart=$(first_word "$free"); fsecs=$(echo "$free" | awk '{print $2}')
+  fmax=$(mb $(( fsecs * SECTOR )))
+
+  case "$size" in
+    all|"") want=$fmax ;;
+    *[!0-9]*) DIE "--size 只能是 all 或数字(MiB)" ;;
+    *) want=$size ;;
+  esac
+  [ "$want" -le "$fmax" ] 2>/dev/null || DIE "要求 $want MiB, 但只剩 $fmax MiB 未分配"
+  [ "$want" -ge 16 ] || DIE "太小了(至少 16 MiB)"
+  secs=$(( want * 2048 ))
+
+  # 分区类型: Linux filesystem
+  ptype=0FC63DAF-8483-4772-8E79-3D69D8477DE4
+  INFO "在 /dev/$d 上新建分区: 起始扇区 $fstart, 大小 $want MiB, 文件系统 $fs"
+
+  INFO "[1/4] 追加分区到分区表"
+  TMPB=/tmp/.ost_before.$$
+  part_table "$disk" | awk '{ n=$1; sub(/.*[^0-9]/,"",n); print n }' | sort > "$TMPB"
+  printf 'start=%s, size=%s, type=%s, name="%s"\n' "$fstart" "$secs" "$ptype" "$label" \
+    | sfdisk --force --append --no-reread "$disk"
+  INFO "[2/4] 让内核发现新分区"
+  partx -a "$disk" 2>/dev/null || true
+  sleep 1
+
+  # 新分区号 = 分区表前后对比的差集。
+  # 不能用"表里最大编号": 官方镜像里有个 128 号的 BIOS boot 分区, 取最大会取到 128 ✗
+  nsuf=$(part_table "$disk" | awk '{ n=$1; sub(/.*[^0-9]/,"",n); print n }' | sort \
+         | grep -vxF -f "$TMPB" | head -1)
+  rm -f "$TMPB"
+  if [ -z "$nsuf" ]; then
+    # 兜底: 找起始扇区等于我们请求值的那一项
+    nsuf=$(part_table "$disk" | awk -v st="$fstart" '{ n=$1; sub(/.*[^0-9]/,"",n); if ($2 == st) print n }' | head -1)
+  fi
+  [ -n "$nsuf" ] || DIE "找不到刚建的分区(请手动检查: sfdisk -d $disk)"
+  ndev=$(target_part_dev "$d" "$nsuf")
+  [ -b "$ndev" ] || DIE "内核还没生成 $ndev(可以稍后手动: partx -a $disk)"
+  OK "分区: $ndev"
+
+  INFO "[3/4] 格式化"
+  case "$fs" in
+    ext4) mkfs.ext4 -F -L "$label" "$ndev" >/dev/null || DIE "mkfs.ext4 失败" ;;
+    vfat|fat|fat32) mkfs.vfat -n "$(printf '%s' "$label" | cut -c1-11 | tr a-z A-Z)" "$ndev" >/dev/null || DIE "mkfs.vfat 失败(固件里没有 mkfs.vfat?)" ;;
+    *) DIE "不支持的文件系统: $fs (可选 ext4 / vfat)" ;;
+  esac
+  OK "格式化完成($fs, 卷标 $label)"
+
+  if [ -z "$target" ]; then
+    OK "未指定 --mount, 跳过挂载"
+    return 0
+  fi
+  INFO "[4/4] 挂载到 $target 并设为开机自动挂载"
+  mkdir -p "$target"
+  fstab_add "$ndev" "$target" "$fs" || WARN "写 fstab 失败(手动挂载见下面提示)"
+  mount_fstab
+  if mountpoint -q "$target" 2>/dev/null || grep -q " $target " /proc/mounts; then
+    OK "已挂载: $ndev -> $target"
+  else
+    WARN "fstab 已写好但还没挂上, 可手动: mount $ndev $target"
+  fi
+  cmd_list_disk_only "$d"
+}
+
+cmd_list_disk_only() {
+  INFO ""
+  INFO "现在 /dev/$1 的分区:"
+  part_table "/dev/$1" 2>/dev/null | while read -r pdev pstart psize ptype puuid pattrs pname; do
+    suf=$(part_suffix "$pdev")
+    dev=$(part_dev_name "$1" "$suf")
+    printf '    %-14s %6s MiB  %s\n' "$dev" "$(mb $(( psize * SECTOR )))" "$(fs_type_at "/dev/$1" $(( pstart * SECTOR )) 2>/dev/null || echo ?)"
+    :
+  done
+}
+
+# =============================================
+# fstab(开机自动挂载) —— 用 block-mount 的 /etc/config/fstab
+# =============================================
+fstab_uuid_of() {
+  # 优先用文件系统 UUID(比设备名稳); 拿不到就退回设备名
+  u=$(block info 2>/dev/null | jsonfilter -e "@[\"$1\"].UUID" 2>/dev/null | head -1 || true)
+  [ -n "$u" ] && [ "$u" != "null" ] && { echo "uuid:$u"; return; }
+  echo "device:$1"
+}
+
+fstab_add() {
+  dev=$1; target=$2; fs=$3
+  ref=$(fstab_uuid_of "$dev")
+  key=${ref%%:*}; val=${ref#*:}
+  uci -q delete "fstab.$target" 2>/dev/null || true
+  uci set "fstab.$target=mount" || return 1
+  uci set "fstab.$target.target=$target"
+  if [ "$key" = "uuid" ]; then
+    uci set "fstab.$target.uuid=$val"
+  else
+    uci set "fstab.$target.device=$val"
+  fi
+  uci set "fstab.$target.fstype=$fs"
+  uci set "fstab.$target.enabled=1"
+  uci commit fstab || return 1
+  return 0
+}
+
+mount_fstab() {
+  if [ -x /etc/init.d/fstab ]; then
+    /etc/init.d/fstab restart >/dev/null 2>&1 || true
+  else
+    block mount >/dev/null 2>&1 || true
+  fi
+}
+
+# =============================================
+# mount / umount : 已有分区
+# =============================================
+cmd_mount() {
+  dev=""; target=""; usefstab=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --target) target=$2; shift 2 ;;
+      --no-fstab) usefstab=0; shift ;;
+      /dev/*) dev=$1; shift ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$dev" ] || DIE "用法: openwrt-storage mount /dev/sdb1 [--target /mnt/xxx] [--no-fstab]"
+  [ -b "$dev" ] || DIE "$dev 不存在"
+  [ -n "$target" ] || target="/mnt/$(basename "$dev")"
+  fs=$(fs_type_at "$dev" 0 2>/dev/null || echo unknown)
+  [ "$fs" = "unknown" ] && DIE "$dev 上没有识别到文件系统(未格式化?)"
+  mkdir -p "$target"
+  INFO "挂载 $dev ($fs) -> $target"
+  if [ "$usefstab" = "1" ]; then
+    fstab_add "$dev" "$target" "$fs" || WARN "写 fstab 失败"
+    mount_fstab
+  fi
+  if ! grep -q " $target " /proc/mounts; then
+    mount -t "$fs" "$dev" "$target" || DIE "mount 失败"
+  fi
+  OK "已挂载: $target   ($(df -h "$target" | awk 'NR==2{print $2" 可用 "$4}'))"
+  [ "$usefstab" = "1" ] && OK "已设为开机自动挂载(/etc/config/fstab)"
+  return 0
+}
+
+cmd_umount() {
+  target=${1:-}
+  [ -n "$target" ] || DIE "用法: openwrt-storage umount /mnt/data"
+  INFO "卸载 $target"
+  umount "$target" 2>/dev/null || { WARN "umount 失败(可能没挂载或被占用)"; }
+  # 顺手删掉 fstab 里对应的自动挂载项
+  idx=$(uci -q show fstab 2>/dev/null | awk -v t="$target" -F. '$0 ~ "target=."t"." { print $2 }' | head -1)
+  if [ -n "$idx" ]; then
+    uci -q delete "fstab.$idx" && uci commit fstab && OK "已取消开机自动挂载(fstab.$idx)"
+  fi
+  return 0
+}
+
+# =============================================
+usage() {
+  cat <<'EOF'
+用法: openwrt-storage <命令> [参数]
+
+  list                              总览: 磁盘 / 分区 / 文件系统 / 挂载 / 未分配空间
+  grow                              把根分区扩到整盘末尾并在线扩容 ext4(不用重启)
+  newpart --disk /dev/mmcblk1       在未分配空间建分区并格式化、挂载
+          [--size all|MiB] [--fs ext4|vfat] [--mount /mnt/data] [--label data]
+  mount /dev/sdb1 [--target /mnt/x] [--no-fstab]
+                                    挂载已有分区(默认写入 fstab = 开机自动挂载)
+  umount /mnt/data                  卸载并取消开机自动挂载
+  -h, --help                        这份帮助
+
+LuCI 里对应: 系统 -> 磁盘管理
+EOF
+}
+
+case "${1:-}" in
+  list|ls|info) cmd_list ;;
+  grow)         shift; cmd_grow "$@" ;;
+  newpart)      shift; cmd_newpart "$@" ;;
+  mount)        shift; cmd_mount "$@" ;;
+  umount|unmount) shift; cmd_umount "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) ERR "未知命令: $1"; usage; exit 1 ;;
+esac
