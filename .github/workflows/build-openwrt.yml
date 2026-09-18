@@ -53,6 +53,11 @@ jobs:
       OAF_LUCI_VER: '7.0-r1'
       # OAF v7.0.1 的预编译内核模块对应的内核版本, 必须与 release 的内核一致
       OAF_KERNEL: '6.12.94'
+      # Argon 主题(iStoreOS 就是基于它): 官方源里没有这个包, 直接把源码里的
+      # 静态文件打进固件。钉住 commit, 保证构建可重复。
+      ARGON_SHA: '182294b07f985088b40610f80ec867fe167e41db'   # luci-theme-argon 2.4.7 (20260824)
+      # DDNS-GO: 官方源里也没有, 直接用上游发布的 linux_x86_64 静态二进制
+      DDNSGO_VER: '6.17.7'
 
     steps:
       - name: Checkout
@@ -258,7 +263,7 @@ jobs:
           # git 不记录权限位, 新增文件会被提交为 100644 —— 实测已发生过一次
           # (files/usr/bin/openwrt 被固化进固件后权限为 644)。
           chmod -R u+rwX,go+rX files || true
-          for d in files/usr/bin files/usr/sbin files/etc/init.d; do
+          for d in files/usr/bin files/usr/sbin files/etc/init.d files/etc/uci-defaults; do
             [ -d "$d" ] || continue
             find "$d" -type f -exec chmod 755 {} +
             echo "==> $d:"
@@ -298,6 +303,59 @@ jobs:
             fi
           done
           echo "==> openwrt-install 自检通过: 语法 OK, 关键函数齐备"
+
+      - name: Stage Argon theme (iStoreOS 风格主题)
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # 官方源里没有 luci-theme-argon(iStoreOS 用的就是自己 fork 的 Argon),
+          # 所以把它当作"自定义文件"直接打进固件 —— 主题就是一堆静态文件:
+          #   htdocs/*  -> /www/                 (CSS/JS/图片)
+          #   ucode/*   -> /usr/share/ucode/     (LuCI 25.x 用的 ucode 模板)
+          #   root/*    -> /                     (含 etc/uci-defaults/30_luci-theme-argon,
+          #                                       首次启动会把 Argon 设为默认主题)
+          TMP=$(mktemp -d)
+          curl -fsSL -o "$TMP/argon.tar.gz" \
+            "https://github.com/jerrykuku/luci-theme-argon/archive/${ARGON_SHA}.tar.gz"
+          tar -xzf "$TMP/argon.tar.gz" -C "$TMP"
+          SRC=$(dirname "$(find "$TMP" -maxdepth 2 -name Makefile | head -1)")
+          for d in htdocs ucode; do
+            [ -d "$SRC/$d" ] || { echo "::error::Argon 源码里没有 $d/ (上游结构变了?)"; exit 1; }
+          done
+          mkdir -p files/www files/usr/share/ucode
+          cp -a "$SRC/htdocs/." files/www/
+          cp -a "$SRC/ucode/."  files/usr/share/ucode/
+          [ -d "$SRC/root" ] && cp -a "$SRC/root/." files/
+          # uci-defaults 与 rpcd 脚本必须可执行(本仓库 core.filemode=false, 权限位不跟着 git 走)
+          find files/etc/uci-defaults -type f -exec chmod 755 {} + 2>/dev/null || true
+          [ -f files/usr/libexec/rpcd/luci.argon_wallpaper ] && \
+            chmod 755 files/usr/libexec/rpcd/luci.argon_wallpaper
+          echo "==> Argon 静态文件 $(find files/www/luci-static/argon -type f | wc -l) 个"
+          ls -l files/etc/uci-defaults/30_luci-theme-argon
+          grep -q 'luci-static/argon' files/etc/uci-defaults/30_luci-theme-argon || {
+            echo "::error::Argon 的 uci-defaults 没有把主题设为默认"; exit 1; }
+          rm -rf "$TMP"
+
+      - name: Stage DDNS-GO (x86_64 静态二进制 + LuCI 页面)
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # 官方源里没有 ddns-go, 直接用上游 release 的静态二进制(11MB, 无依赖);
+          # 它的 LuCI 页面(服务 -> DDNS-GO)在本仓库 files/ 里, 是 Lua 写的。
+          TMP=$(mktemp -d)
+          curl -fsSL -o "$TMP/ddns-go.tar.gz" \
+            "https://github.com/jeessy2/ddns-go/releases/download/v${DDNSGO_VER}/ddns-go_${DDNSGO_VER}_linux_x86_64.tar.gz"
+          tar -xzf "$TMP/ddns-go.tar.gz" -C "$TMP"
+          [ -f "$TMP/ddns-go" ] || { echo "::error::ddns-go 压缩包里没有 ddns-go"; exit 1; }
+          install -m 0755 "$TMP/ddns-go" files/usr/bin/ddns-go
+          file files/usr/bin/ddns-go || true
+          # 必须是静态链接(固件是 musl, 动态链接的二进制在设备上起不来)且能报版本
+          if readelf -d files/usr/bin/ddns-go 2>/dev/null | grep -q NEEDED; then
+            echo "::error::ddns-go 不是静态链接, 设备上会起不来"; exit 1
+          fi
+          files/usr/bin/ddns-go -v
+          ls -l files/usr/bin/ddns-go
+          rm -rf "$TMP"
 
       - name: Drop serial console from kernel cmdline (thin clients / Wyse 3040)
         if: steps.release.outputs.build == 'true'

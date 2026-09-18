@@ -407,3 +407,41 @@ config mount
 
 > 这一步依赖 **`block-mount`**（提供 `/etc/config/fstab` 与 `/etc/init.d/fstab`），
 > 本固件已内置；`mkfs.ext4` / `e2fsck` 由缺省已装的 `e2fsprogs` 提供。
+
+## 内置的额外组件
+
+### Argon 主题（iStoreOS 就是基于它的）
+
+- 官方源里**没有** `luci-theme-argon`（iStoreOS 用的是自己 fork 的版本），所以构建时把
+  它源码里的文件直接打进固件：`htdocs/*` → `/www/`、`ucode/*` → `/usr/share/ucode/`、
+  `root/*` → `/`（其中 `etc/uci-defaults/30_luci-theme-argon` 会在**首次启动**把 Argon
+  设为默认主题：`luci.main.mediaurlbase=/luci-static/argon`）
+- 版本：`luci-theme-argon` 2.4.7（20260824，commit `182294b0`）—— 钉在 workflow 的
+  `ARGON_SHA` 里，升级只需改这一个变量
+- 想切回官方默认主题：LuCI → 系统 → 系统 → 语言和界面 → 设计主题；或 SSH：
+  ```sh
+  uci set luci.main.mediaurlbase=/luci-static/bootstrap && uci commit luci
+  ```
+
+### DDNS-GO（自带 LuCI 页面，界面中文）
+
+- 官方源里没有 `ddns-go`，构建时直接用上游 release 的 **linux_x86_64 静态二进制**
+  （v6.17.7，约 11 MB）放进 `/usr/bin/ddns-go`（构建时会校验它是静态链接且能 `-v`）
+- 服务由 procd 托管：`/etc/init.d/ddns-go`，配置 `/etc/config/ddns-go`
+  ```sh
+  uci show ddns-go
+  uci set ddns-go.main.port=9876        # 网页配置界面端口
+  uci set ddns-go.main.frequency=300    # 检查公网 IP 的频率(秒)
+  uci set ddns-go.main.enabled=1        # 开机自启
+  /etc/init.d/ddns-go restart
+  ```
+- **LuCI 页面**：菜单 **服务 → DDNS-GO**（Lua 实现，中文界面）—— 显示运行状态 / PID /
+  开机自启 / 检查频率，并带"启动、停止、重启、打开配置页面"按钮
+- **配置本身**在 DDNS-GO 自带的中文网页界面：`http://路由器IP:9876`
+  （第一次进去要先设置用户名密码，然后添加你的域名与 DNS 服务商）
+- 配置文件：`/etc/ddns-go/config.yaml`；日志：`logread | grep ddns-go`
+- 为它和主题额外装的包：`luci-compat` + `luci-lua-runtime`（Lua 版 LuCI 页面需要）、
+  `jsonfilter` + `wget-ssl`（Argon 主题的壁纸脚本需要）
+
+> 这两个组件都不是"从源码编译"的：主题是纯静态文件，DDNS-GO 是上游发布的静态二进制，
+> 所以 ImageBuilder 就够用，不需要 SDK 编译环境。

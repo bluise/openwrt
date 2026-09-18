@@ -68,3 +68,15 @@ luci
 luci-ssl
 luci-i18n-base-zh-cn
 luci-i18n-firewall-zh-cn
+
+# ---- Argon 主题(iStoreOS 风格) 与 DDNS-GO 的 LuCI 页面所需 ----
+# 注意: luci-theme-argon 和 ddns-go 官方源里都没有, 由 workflow 直接把文件
+# 打进固件(见 "Stage Argon theme" / "Stage DDNS-GO" 两步), 所以不在这里列包名。
+# 这里只列它们的运行时依赖:
+jsonfilter
+wget-ssl
+
+# ---- Lua 版 LuCI 应用支持(自带的 DDNS-GO 页面是 Lua 写的) ----
+# LuCI 25.x 把 Lua 运行时与兼容层单独分包, 缺了它们这个页面会 500。
+luci-compat
+luci-lua-runtime
