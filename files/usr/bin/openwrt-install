@@ -1,9 +1,11 @@
 #!/bin/sh
 # =============================================
 # openwrt-install : 一键安装 OpenWrt 到内置硬盘
-# 用法: openwrt-install [固件路径]
+# 用法: openwrt-install [选项] [固件路径]
 #   - 不带参数时自动查找当前启动介质上的固件(挂载点或U盘里的 *combined-efi*.img.gz)
-#   - 自动识别内置 SATA/NVMe 硬盘(排除启动U盘)
+#   - 自动识别内置盘并**排除启动盘与U盘**, 判断全部读 sysfs
+#     (不能用 lsblk: 固件里没有该命令, 详见下面的说明)
+#   - 多块候选盘时列出让你选; 非交互环境不会瞎猜, 必须用 --disk 指定
 #   - 写入后只读检测空间: rootfs 固定 2048 MiB 为设计目标, 剩余空间保持未分配
 #     (只读探测, 不自动修改分区表; 需要扩容时会打印具体命令)
 # =============================================
@@ -19,37 +21,244 @@ log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
-# ---------- 1. 确定目标磁盘(内置 SATA/NVMe, 排除启动U盘) ----------
-find_target_disk() {
-  BOOT_DEV=$(mount | awk '$3 == "/" {print $1}' | sed 's/[0-9]*$//; s/\/dev\///')
-  if [ -z "$BOOT_DEV" ]; then
-    BOOT_DEV=$(findmnt -no SOURCE / | sed 's/[0-9]*$//; s/\/dev\///')
-  fi
-  log_info "当前启动设备: /dev/$BOOT_DEV"
+# ---------- 1. 确定目标磁盘(排除启动盘与U盘) ----------
+# 判断依据全部来自 sysfs, 不用 lsblk:
+#   lsblk 是 util-linux 的独立包, 缺省固件里没有(packages.list 也没加),
+#   busybox 更不提供该 applet。原先用 `lsblk -dno TRAN` 判断 USB, 在真机上
+#   恒为空字符串 —— 后果是 U 盘从不被跳过, 且 find_firmware 的"挂载U盘
+#   找固件"分支永远不生效。改成读 sysfs 路径后与工具包无关。
 
-  if [ -b /dev/sda ]; then DISKS="sda"; fi
-  for d in sda sdb sdc sdd sde; do
-    if [ -b /dev/$d ]; then
-      TRAN="$(lsblk -dno TRAN /dev/$d 2>/dev/null)"
-      # TRAN 为 sata / nvme / usb
-      if [ "$TRAN" = "usb" ]; then
-        log_warn "跳过U盘 /dev/$d ($TRAN)"
-      elif [ "$d" != "$BOOT_DEV" ]; then
-        TARGET="/dev/$d"
-        log_info "发现候选硬盘: /dev/$d ($TRAN)"
-      fi
+# 设备名 -> 整盘名: sda2->sda, nvme0n1p2->nvme0n1, mmcblk0p2->mmcblk0
+disk_of_part() {
+  n=$(basename "$1")
+  if [ -r "/sys/class/block/$n/partition" ]; then
+    # 分区: 解析 sysfs 路径的父目录名(即整盘名)
+    real=$(readlink -f "/sys/class/block/$n" 2>/dev/null || true)
+    b=$(basename "$(dirname "$real")" 2>/dev/null || true)
+    # 校验 b 确实是一块整盘, 避免 readlink 异常时返回垃圾值
+    if [ -n "$b" ] && [ -d "/sys/class/block/$b" ] && [ ! -e "/sys/class/block/$b/partition" ]; then
+      echo "$b"; return
     fi
+  elif [ -e "/sys/class/block/$n" ]; then
+    echo "$n"; return
+  fi
+  # sysfs 不可用时的名字兜底
+  case "$n" in
+    nvme*|mmcblk*|md*|pmem*) case "$n" in *p[0-9]*) echo "${n%p[0-9]*}" ;; *) echo "$n" ;; esac ;;
+    *[0-9]) echo "${n%[0-9]*}" ;;
+    *) echo "$n" ;;
+  esac
+}
+
+# 传输类型: USB 设备的 sysfs 路径里一定有一段 /usbN。
+# 只认路径, 不看 removable —— USB 硬盘盒的 removable 常为 0,
+# 而读卡器又常为 1, 都不能作为判据。
+disk_transport() {
+  d=$(basename "$1")
+  case "$(readlink -f "/sys/class/block/$d" 2>/dev/null)" in
+    */usb[0-9]*|*/usb/*) echo usb ;;
+    *) echo "" ;;
+  esac
+}
+
+# 列出所有"整盘"(排除分区/虚拟设备/光驱): sda sdb nvme0n1 vda ...
+list_disks() {
+  for p in /sys/class/block/*; do
+    [ -e "$p" ] || continue
+    d=$(basename "$p")
+    if [ -e "$p/partition" ]; then continue; fi
+    if [ ! -e "$p/device" ]; then continue; fi
+    case "$d" in loop*|ram*|zram*|dm-*|md*|sr*|fd*|nbd*) continue ;; esac
+    if [ ! -b "/dev/$d" ]; then continue; fi
+    printf '%s\n' "$d"
+  done
+}
+
+# 启动盘: OpenWrt 里 /rom 是真实根文件系统所在(overlay 的 / 不行),
+# 读不到再退到内核命令行 root=
+find_boot_src() {
+  BOOT_SRC=""
+  for mp in /rom /; do
+    s=$(awk -v m="$mp" '$3 == m {print $1; exit}' /proc/mounts 2>/dev/null || true)
+    if [ -z "$s" ]; then
+      s=$(findmnt -no SOURCE "$mp" 2>/dev/null || true)
+    fi
+    case "$s" in /dev/*) BOOT_SRC=$s; break ;; esac
+  done
+  if [ -z "$BOOT_SRC" ]; then
+    r=$(sed -n 's/.*[[:space:]]root=\([^[:space:]]*\).*/\1/p' /proc/cmdline 2>/dev/null || true)
+    case "$r" in /dev/*) BOOT_SRC=$r ;; esac
+  fi
+  [ -n "$BOOT_SRC" ] || return 1
+  echo "$BOOT_SRC"
+}
+
+# 某块设备底下的物理整盘(顺着 slaves 递归, 处理 md/lvm 叠加):
+#   /dev/mapper/vg-lv -> dm-0 -> md0 -> sda3 -> sda
+boot_disks_of() {
+  n=$(basename "$1")
+  p="/sys/class/block/$n"
+  if [ ! -e "$p" ]; then
+    # 名字不在 sysfs(如 /dev/mapper/xxx), 先用 readlink 规范化成 dm-N
+    real=$(readlink -f "$1" 2>/dev/null || true)
+    n=$(basename "$real")
+    p="/sys/class/block/$n"
+  fi
+  if [ -e "$p/slaves" ]; then
+    found=0
+    for s in "$p"/slaves/*; do
+      [ -e "$s" ] || continue
+      found=1
+      boot_disks_of "/dev/$(basename "$s")"
+    done
+    [ "$found" = "1" ] && return 0
+  fi
+  disk_of_part "/dev/$n"
+}
+
+# 启动盘名字列表(空格分隔, 可能多块)
+find_boot_disks() {
+  SRC=$(find_boot_src 2>/dev/null || true)
+  [ -n "$SRC" ] || return 1
+  boot_disks_of "$SRC" | tr '\n' ' '
+}
+
+# $1 是否为启动盘名字
+is_boot_disk() {
+  for b in $BOOT_DISKS; do
+    [ "$b" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# 人类可读的盘信息: 容量 + 型号 (供候选列表与倒计时显示)
+disk_desc() {
+  d=$(basename "$1")
+  sz=$(cat "/sys/class/block/$d/size" 2>/dev/null || true)
+  human="?"
+  if [ -n "$sz" ] && [ "$sz" -gt 0 ] 2>/dev/null; then
+    b=$((sz * 512))
+    g10=$((b * 10 / 1073741824))
+    if [ "$g10" -ge 10 ]; then
+      human="$((g10 / 10)).$((g10 % 10)) GiB"
+    else
+      human="$((b / 1048576)) MiB"
+    fi
+  fi
+  model=$(cat "/sys/class/block/$d/device/model" 2>/dev/null | tr -d '\n' | sed 's/[[:space:]]*$//' || true)
+  t=$(disk_transport "$d")
+  printf '%s%s%s' "$human" "${model:+  $model}" "${t:+  ($t)}"
+}
+
+# 候选列表 CAND(形如 " sdb sdc")的第一项
+first_cand() {
+  c=${CAND# }
+  echo "${c%% *}"
+}
+
+# 确定目标盘。显式指定(--disk) > 唯一候选 > 交互选择; 绝不静默挑一块。
+# 传入 --first 时表示只做只读探测(菜单 2/6), 多块候选就取第一块。
+find_target_disk() {
+  FIRST_ONLY=0
+  [ "${1:-}" = "--first" ] && FIRST_ONLY=1
+
+  TARGET=""
+  BOOT_DISKS=$(find_boot_disks 2>/dev/null || true)
+  if [ -n "$BOOT_DISKS" ]; then
+    for b in $BOOT_DISKS; do
+      log_info "启动盘: /dev/$b  ($(disk_desc "$b"))"
+    done
+  else
+    log_warn "无法识别启动盘(不影响安装, 但请确认目标盘没写错)"
+  fi
+
+  # (1) 显式指定
+  if [ -n "$FORCE_DISK" ]; then
+    f=$(basename "$FORCE_DISK")
+    if [ ! -b "/dev/$f" ]; then
+      log_err "指定的目标盘不存在: $FORCE_DISK"
+      return 1
+    fi
+    if is_boot_disk "$f"; then
+      log_err "$FORCE_DISK 是当前启动盘, 拒绝写入(会清空正在运行的系统)"
+      log_warn "  要重刷这块盘: 从 U 盘启动后再执行, 或直接用 sysupgrade 升级。"
+      return 1
+    fi
+    if [ "$(disk_transport "$f")" = "usb" ]; then
+      log_warn "$FORCE_DISK 是 USB 设备 —— 你显式指定了, 按你的意思继续"
+    fi
+    TARGET="/dev/$f"
+    log_info "目标盘(显式指定): $TARGET  ($(disk_desc "$f"))"
+    return 0
+  fi
+
+  # (2) 自动筛选
+  CAND=""
+  for d in $(list_disks); do
+    if is_boot_disk "$d"; then
+      log_warn "跳过启动盘 /dev/$d"
+      continue
+    fi
+    if [ "$(disk_transport "$d")" = "usb" ]; then
+      log_warn "跳过USB设备 /dev/$d"
+      continue
+    fi
+    log_info "候选盘: /dev/$d  ($(disk_desc "$d"))"
+    CAND="$CAND $d"
   done
 
-  if [ -b /dev/nvme0n1 ]; then
-    TARGET="/dev/nvme0n1"
-    log_info "发现NVMe硬盘: /dev/nvme0n1"
+  N=0
+  for d in $CAND; do N=$((N + 1)); done
+
+  if [ "$N" -eq 0 ]; then
+    log_err "未找到可写入的硬盘!"
+    log_warn "已排除启动盘(${BOOT_DISKS:-未知})与所有 USB 设备。"
+    log_warn "要写到外置盘/U盘请显式指定: openwrt-install --disk /dev/sdX"
+    log_warn "若这台机器只有一块盘且正是启动盘: 请从 U 盘启动后再装, 或用 sysupgrade 升级。"
+    return 1
   fi
 
-  if [ -z "$TARGET" ]; then
-    log_err "未找到可写入的内置硬盘! 请检查硬盘或手动指定 /dev/xxx"
-    exit 1
+  if [ "$N" -eq 1 ]; then
+    TARGET="/dev/$(first_cand)"
+    log_info "目标盘(唯一候选): $TARGET  ($(disk_desc "$(basename "$TARGET")"))"
+    return 0
   fi
+
+  # (3) 多块候选: 只探测时取第一块, 否则必须由人确认
+  log_warn "检测到 $N 块可写入的磁盘:"
+  i=0
+  for d in $CAND; do
+    i=$((i + 1))
+    echo "    $i) /dev/$d  ($(disk_desc "$d"))"
+  done
+
+  if [ "$FIRST_ONLY" = "1" ]; then
+    # 注意: 不能用 `for d in $CAND; do TARGET=...; done` —— 那样留下的是
+    # 最后一块, 与这里的"只探测第一块"语义相反。
+    TARGET="/dev/$(first_cand)"
+    log_info "(仅探测)使用第一块候选盘: $TARGET"
+    return 0
+  fi
+
+  if [ ! -t 0 ]; then
+    log_err "当前不是交互终端, 无法询问, 拒绝替你猜哪块盘。"
+    log_warn "请用 --disk /dev/sdX 指定目标盘后重试。"
+    return 1
+  fi
+
+  printf '请输入编号并回车: '
+  read -r SEL
+  i=0
+  for d in $CAND; do
+    i=$((i + 1))
+    if [ "$SEL" = "$i" ]; then
+      TARGET="/dev/$d"
+      log_info "已选择: $TARGET  ($(disk_desc "$d"))"
+      return 0
+    fi
+  done
+  log_err "无效的编号: $SEL"
+  return 1
 }
 
 # ---------- 2. 确定固件路径 ----------
@@ -65,13 +274,16 @@ find_firmware() {
     [ -n "$FW" ] && break
   done
   if [ -z "$FW" ]; then
-    # 尝试再次挂载U盘(排除内置盘)
-    for part in /dev/sd*[0-9]; do
-      [ -b "$part" ] || continue
-      TRAN="$(lsblk -dno TRAN "$(echo "$part" | sed 's/[0-9]*$//')" 2>/dev/null)"
-      [ "$TRAN" = "usb" ] || continue
+    # 尝试再次挂载U盘的分区找固件(只找 USB 上的分区, 不碰内置盘)
+    # 判据同样来自 sysfs: 原先的 `lsblk -dno TRAN` 在固件里恒为空,
+    # 导致这个分支实际上从来没执行过。
+    for p in /sys/class/block/*; do
+      [ -e "$p/partition" ] || continue
+      part=$(basename "$p")
+      [ -b "/dev/$part" ] || continue
+      [ "$(disk_transport "$(disk_of_part "$part")")" = "usb" ] || continue
       mkdir -p /mnt/usb
-      mount "$part" /mnt/usb 2>/dev/null || continue
+      mount "/dev/$part" /mnt/usb 2>/dev/null || continue
       FW=$(find /mnt/usb -maxdepth 3 -name "*combined-efi*.img.gz" 2>/dev/null | head -1)
       [ -n "$FW" ] && break
       umount /mnt/usb 2>/dev/null || true
@@ -85,7 +297,8 @@ find_firmware() {
 
 # ---------- 3. 倒计时 ----------
 countdown() {
-  log_warn "5秒后将把 $FW 写入 $TARGET, 该操作会清空目标盘所有数据!"
+  log_warn "5秒后将把 $FW 写入 $TARGET  ($(disk_desc "$(basename "$TARGET")"))"
+  log_warn "该操作会清空 $TARGET 上的所有数据! (Ctrl+C 可取消)"
   i=5
   while [ $i -gt 0 ]; do
     echo -n "$i... "; i=$((i-1)); sleep 1
@@ -300,17 +513,24 @@ input_box() { # $1=标题 $2=提示 $3=默认值 -> 结果打印到 stdout
   fi
 }
 
-# 校验 IPv4 点分十进制 (借内核的 inet_pton 判断, 避免手写解析出漏洞)
+# 校验 IPv4 点分十进制 (纯 shell, 不依赖 python3 —— 固件里没有 python3)
 valid_ipv4() {
-  printf '%s' "$1" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || return 1
-  python3 -c "import socket,sys; socket.inet_aton(sys.argv[1])" "$1" 2>/dev/null && return 0
-  # 没有 python3 时用内核 inet_pton
-  ipcalc.sh "$1" >/dev/null 2>&1
+  printf '%s' "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+  # 每段必须是 0-255, 且不接受前导零(010 会被当作八进制解析)
+  OIFS=$IFS; IFS=.
+  for o in $1; do
+    case "$o" in
+      0|[1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) : ;;
+      *) IFS=$OIFS; return 1 ;;
+    esac
+  done
+  IFS=$OIFS
+  return 0
 }
 
 # 修改 LAN 口 IP (对应 iStoreOS quickstart 里的改 IP 功能)
 change_lan_ip() {
-  CUR=$(uci -q get network.lan.ipaddr 2>/dev/null)
+  CUR=$(uci -q get network.lan.ipaddr 2>/dev/null || true)
   [ -n "$CUR" ] || CUR=10.0.0.1
   NEW=$(input_box "修改 LAN 口 IP" "请输入新的 LAN 口 IP 地址 (当前 $CUR):" "$CUR") || return 0
   [ -n "$NEW" ] || return 0
@@ -359,8 +579,8 @@ set_nic_mode() {
     msg "错误" "未检测到物理以太网口。\n若使用 USB 网卡, 请确认已插好或已装驱动。"
     return 1
   fi
-  CUR=$(uci -q get network.wan.device 2>/dev/null)
-  CURW=$(uci -q get network.lan.device 2>/dev/null)
+  CUR=$(uci -q get network.wan.device 2>/dev/null || true)
+  CURW=$(uci -q get network.lan.device 2>/dev/null || true)
   if [ -n "$CUR" ]; then
     MODE_DESC="当前: 双网卡 (LAN=$CURW, WAN=$CUR)"
   else
@@ -407,7 +627,7 @@ set_nic_mode() {
     uci set network.lan.device="$FIRST"
     for d in $REST; do uci add_list network.lan.device="$d" 2>/dev/null || true; done
     # 单网卡时 LAN 会自动成为 DHCP 客户端? 不 —— 保持静态地址便于管理
-    RESULT="单网卡模式: $NICS 全部作为 LAN (静态 $(uci -q get network.lan.ipaddr))"
+    RESULT="单网卡模式: $NICS 全部作为 LAN (静态 $(uci -q get network.lan.ipaddr 2>/dev/null || echo 未设置))"
   else
     # 双网卡: 首个作 WAN, 其余作 LAN 桥
     uci -q delete network.lan.device 2>/dev/null || true
@@ -442,7 +662,7 @@ set_nic_mode() {
 show_interfaces() {
   TXT=$(ip -4 addr show 2>/dev/null | awk '/^[0-9]+:/{iface=$2} /inet /{print iface" "$2}' | sed 's/:$//' | head -20)
   [ -n "$TXT" ] || TXT=$(ifconfig -a 2>/dev/null | head -20)
-  LAN=$(uci -q get network.lan.ipaddr 2>/dev/null)
+  LAN=$(uci -q get network.lan.ipaddr 2>/dev/null || true)
   msg "网络接口" "LAN 管理地址: ${LAN:-未知}\n(设备名 eth0/eth1 等, 取决于网卡)\n\n$TXT"
 }
 
@@ -471,10 +691,10 @@ EOF
         case "$A" in y|Y) do_install || true ;; *) echo "已取消" ;; esac
         ;;
       2|6)
-        if find_target_disk >/dev/null 2>&1; then
+        if find_target_disk --first >/dev/null 2>&1; then
           post_install_space_report "$TARGET" || true
         else
-          echo "未找到可用的内置硬盘。"
+          echo "未找到可用的硬盘(详见上面的排除原因)。"
         fi
         ;;
       3)
@@ -519,7 +739,7 @@ main_menu() {
         fi
         ;;
       2|6)
-        if find_target_disk >/dev/null 2>&1; then
+        if find_target_disk --first >/dev/null 2>&1; then
           TMPF=$(mktemp 2>/dev/null || echo /tmp/.ospace.$$)
           post_install_space_report "$TARGET" >"$TMPF" 2>&1 || true
           TXT=$(sed 's/\x1b\[[0-9;]*m//g' "$TMPF" 2>/dev/null)
@@ -530,7 +750,7 @@ main_menu() {
             msg "扩容命令" "${TXT:-当前无需扩容}"
           fi
         else
-          msg "错误" "未找到可用的内置硬盘。"
+          msg "错误" "未找到可用的硬盘(启动盘与 USB 设备已被排除)。"
         fi
         ;;
       3) change_lan_ip || true ;;
@@ -560,7 +780,18 @@ do_install() {
   post_install_space_report "$TARGET" || true
 
   log_info "安装完成! 请拔掉U盘重启, 首次启动约需2-3分钟."
-  log_info "默认管理地址: http://10.0.0.1 (LAN口 eth1)"
+
+  # 这里是"重启后怎么进去"的提示, 必须按当前 uci 配置来读。
+  # 原先硬编码 "10.0.0.1 (LAN口 eth1)": 一旦用菜单 7 改过网口模式,
+  # 这句话就是错的, 会把人指向不存在的口。
+  LAN_IP=$(uci -q get network.lan.ipaddr 2>/dev/null || true)
+  [ -n "$LAN_IP" ] || LAN_IP=10.0.0.1
+  LAN_DEV=$(uci -q get network.lan.device 2>/dev/null || true)
+  if [ "$LAN_DEV" = "br-lan" ]; then
+    PORTS=$(uci -q get network.@device[0].ports 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)
+    [ -n "$PORTS" ] && LAN_DEV="br-lan($PORTS)"
+  fi
+  log_info "管理地址: http://${LAN_IP:-<见 /etc/config/network>}   LAN 口: ${LAN_DEV:-<见 /etc/config/network>}"
   return 0
 }
 
@@ -572,25 +803,49 @@ usage() {
   (无参数)        显示交互式菜单 (推荐)
   --no-menu       跳过菜单, 直接安装到内置硬盘(原一键安装行为)
   --change-ip     直接进入"修改 LAN 口 IP"功能(对应 quickstart 的改 IP)
+  --disk <设备>   指定目标盘, 例如 --disk /dev/sdb
+                  (多块盘且非交互环境下**必须**用它; 也接受
+                   OPENWRT_TARGET_DISK=/dev/sdb 环境变量)
   -h, --help      显示本帮助
+
+目标盘的选择规则:
+  排除 启动盘 与 所有 USB 设备 -> 唯一候选直接用
+  多块候选 -> 列出让你选(非交互环境报错退出, 不会替你猜)
+  --disk 指定 -> 直接用(仍会拒绝当前启动盘)
 
 示例:
   openwrt-install                                  # 菜单模式
   openwrt-install --no-menu                        # 一键安装(自动找固件/目标盘)
   openwrt-install --no-menu /mnt/sda1/xxx.img.gz   # 指定固件
+  openwrt-install --no-menu --disk /dev/sdb        # 指定目标盘
   openwrt-install --change-ip                      # 只改 IP
 EOF
 }
 
 main() {
-  # 帮助与非法选项不需要 root, 先处理
-  case "${1:-}" in
-    -h|--help) usage; exit 0 ;;
-    -*) case "${1:-}" in
-          --change-ip|--no-menu) : ;;
-          *) log_err "未知选项: $1"; usage; exit 2 ;;
-        esac ;;
-  esac
+  MODE=menu
+  FW_ARG=""
+  FORCE_DISK=${OPENWRT_TARGET_DISK:-}
+
+  # 先解析选项(不做 root 检查, 保证 --help 谁都能看)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      --no-menu) MODE=install ;;
+      --change-ip) MODE=changeip ;;
+      --disk)
+        shift
+        if [ -z "${1:-}" ]; then
+          log_err "--disk 需要一个设备路径, 例如 --disk /dev/sdb"
+          exit 2
+        fi
+        FORCE_DISK=$1 ;;
+      --disk=*) FORCE_DISK=${1#--disk=} ;;
+      -*) log_err "未知选项: $1"; usage; exit 2 ;;
+      *) FW_ARG=$1 ;;
+    esac
+    shift
+  done
 
   # 写盘/改网络都需要 root
   if [ "$(id -u 2>/dev/null || echo 0)" != "0" ]; then
@@ -599,15 +854,15 @@ main() {
     exit 1
   fi
 
-  case "${1:-}" in
-    --change-ip)
-      shift 2>/dev/null || true
-      change_lan_ip; exit 0 ;;
-    --no-menu)
-      shift 2>/dev/null || true
-      do_install "$@"; exit $? ;;
-    -*)
-      log_err "未知选项: $1"; usage; exit 2 ;;
+  case "$MODE" in
+    changeip) change_lan_ip; exit 0 ;;
+    install)
+      if [ -n "$FW_ARG" ]; then
+        do_install "$FW_ARG"
+      else
+        do_install
+      fi
+      exit $? ;;
   esac
 
   # 默认进菜单: 有 whiptail 用图形菜单(方向键选择), 否则用同内容的编号菜单

@@ -14,6 +14,7 @@ GitHub Actions 在线自动构建 OpenWrt 25.12 x86_64 固件（基于官方 Ima
 - **LuCI 中文界面 + HTTPS**
 - **rootfs 分区 2048 MiB**（官方默认仅约 104 MiB，见下文「空间与扩容」）
 - **内置 `resize2fs` + `sfdisk`**，装到内置盘后可直接扩容
+- **内置 `block-mount`**，自建的数据分区可开机自动挂载（见文末）
 - **内置 `openwrt` 命令**（`openwrt-install` 的快捷入口）打开交互式安装助手（装到内置硬盘 / 改 LAN IP / 改密码 / 网口模式 / 查看磁盘与网口）
 
 ## 网络默认
@@ -105,11 +106,29 @@ openwrt
 ```
 
 选 `1` 安装，脚本会：
-1. 自动识别内置 SATA/NVMe 硬盘（**排除启动 U 盘**）
+1. 自动识别**可写入的硬盘**：排除当前启动盘与所有 USB 设备（判据直接读 sysfs，
+   不依赖固件里根本没有的 `lsblk`）
 2. 自动查找 U 盘上的固件镜像
-3. 显示目标盘并**倒计时 5 秒**（此时 Ctrl+C 可取消）—— **会清空目标盘所有数据**
+3. 显示目标盘（型号 + 容量）并**倒计时 5 秒**（此时 Ctrl+C 可取消）—— **会清空目标盘所有数据**
 4. 写入镜像
 5. 只读检测空间并说明结果
+
+### 目标盘是怎么选的（多块盘必看）
+
+```
+--disk 显式指定  >  唯一候选盘  >  列出让你选
+排除项: 当前启动盘(经 sysfs slaves 解析 dm/md 叠加) + 所有 USB 设备
+```
+
+- **唯一候选**：直接用，日志里会打印它是哪块盘、多大、什么型号
+- **多块候选**：列出编号让你输入，**不会替你猜**
+- **非交互环境**（脚本里跑 `--no-menu`，没有终端）：多块候选时**直接报错退出**，
+  必须用 `--disk /dev/sdX` 指定 —— 宁可失败，不押注哪块盘
+- **`--disk` 指定了启动盘**会被拒绝（避免把正在运行的系统就地清空）
+- 指定 USB 设备是允许的（比如你要装到 USB 硬盘盒），但会打印警告
+
+> 判断"是不是 USB"读的是 sysfs 路径里有没有 `/usbN` 这一段，不是 `removable`：
+> USB 硬盘盒的 `removable` 常为 0、读卡器又常为 1，都不能当判据。
 
 ### 命令行用法（非交互）
 
@@ -119,6 +138,7 @@ openwrt-install --no-menu          # 跳过菜单, 直接一键安装
 openwrt-install --change-ip        # 只改 LAN 口 IP
 openwrt-install -h                 # 查看全部用法
 openwrt-install --no-menu /path/to/openwrt-*.img.gz   # 指定固件
+openwrt-install --no-menu --disk /dev/sdb             # 指定目标盘(多块盘时必用)
 ```
 
 > 菜单界面由 `whiptail` 提供（已内置）。若在没有终端的环境调用，脚本会自动回退为纯文本交互，不会卡住。
@@ -255,3 +275,6 @@ config mount
 
 然后 `/etc/init.d/fstab enable && /etc/init.d/fstab restart`。
 用 UUID 而非 `/dev/sda3` 更稳妥（设备名可能变化）。
+
+> 这一步依赖 **`block-mount`**（提供 `/etc/config/fstab` 与 `/etc/init.d/fstab`），
+> 本固件已内置；`mkfs.ext4` / `e2fsck` 由缺省已装的 `e2fsprogs` 提供。
