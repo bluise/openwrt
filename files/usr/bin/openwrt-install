@@ -215,8 +215,8 @@ is_boot_disk() {
 # 那种情况**不该**阻止安装 —— 写盘前把它们卸掉就行(见 unmount_target)。
 mount_is_critical() {
   case "$1" in
-    /mnt/*|/media/*) return 1 ;;
-    *) return 0 ;;      # / /rom /boot /overlay ... 以及任何不认识的挂载点都算关键
+    /|/rom|/overlay|/rom/*|/overlay/*) return 0 ;;
+    *) return 1 ;;   # 其余(含 /boot、/mnt/*): 允许当目标盘, 写盘前先卸载; 卸不掉才拒绝
   esac
 }
 
@@ -256,6 +256,11 @@ unmount_target() {
     done
   parts2=$(disk_mounts "$t" || true)
   if [ -n "$parts2" ]; then
+    if [ "$FORCE_WIPE" = "1" ]; then
+      log_warn "$(zh_en "目标盘仍有分区在挂载: $parts2 —— 因为你给了 --force, 继续写(正在运行的系统可能会崩)" \
+                        "Target still has mounted partitions: $parts2 - continuing because of --force (the running system may break)")"
+      return 0
+    fi
     log_err "$(zh_en "目标盘仍有分区在挂载: $parts2 —— 拒绝写入(先手动 umount, 或用 --force)" \
                       "Target still has mounted partitions: $parts2 - refusing to write (umount it, or use --force)")"
     return 1
@@ -269,6 +274,31 @@ is_mounted_disk() {
     [ "$b" = "$1" ] && return 0
   done
   return 1
+}
+
+# 解释"这块盘为什么不能当目标盘": 明确列出哪个分区挂在哪, 再给办法
+explain_in_use() {   # $1=整盘名
+  d=$1
+  mm=$(disk_mounts "$d" || true)
+  log_warn "$(zh_en "跳过正在使用的盘 /dev/$d —— 它的分区正被运行中的系统占用: $mm" \
+                    "Skipping disk in use /dev/$d - its partitions are in use by the running system: $mm")"
+  case "$mm" in
+    *"@/overlay"*|*"@/rom"*)
+      log_warn "$(zh_en '  这块盘正被当作当前系统的根/可写层(overlay)。三种办法:' \
+                        '  This disk is serving as the running system root/overlay. Three options:')"
+      log_warn "$(zh_en '    1) 换用 ext4 版镜像做 U 盘启动 —— 可写层就在 U 盘上, 不会占用内置盘(最推荐)' \
+                        '    1) Boot from the *ext4* variant USB instead - its writable layer lives on the USB (best)')"
+      log_warn "$(zh_en '    2) 先清掉这块盘的分区表再重启安装:' \
+                        '    2) Clear this disk'\''s partition table, then reboot and install:')"
+      log_warn "         dd if=/dev/zero of=/dev/$d bs=1M count=16 conv=fsync"
+      log_warn "$(zh_en "    3) 确认可以破坏当前运行的系统时: openwrt-install --force --disk /dev/$d" \
+                        "    3) If breaking the running system is acceptable: openwrt-install --force --disk /dev/$d")"
+      ;;
+    *)
+      log_warn "$(zh_en "  办法: 先 umount 这些分区再重试(例如 umount ${mm%%@*}); 或加 --force 强行写" \
+                        "  Fix: umount them first (e.g. umount ${mm%%@*}), or add --force to write anyway")"
+      ;;
+  esac
 }
 
 # 人类可读的盘信息: 容量 + 型号 (供候选列表与倒计时显示)
@@ -345,10 +375,7 @@ find_target_disk() {
       continue
     fi
     if is_mounted_disk "$d"; then
-      log_warn "$(zh_en "跳过正在使用的盘 /dev/$d (承载系统本身的分区在挂载: $(disk_mounts "$d"))" \
-                        "Skipping disk in use /dev/$d (a partition holding the running system: $(disk_mounts "$d"))")"
-      log_warn "$(zh_en '  确实要写它: 加 --force, 或先 umount 再重试' \
-                        '  If you really mean it: add --force, or umount it first')"
+      explain_in_use "$d"
       continue
     fi
     # 只是数据分区被自动挂载(老系统残留)不算在用: 写盘前会先卸掉
@@ -1260,7 +1287,9 @@ Usage: openwrt-install [options] [firmware.img.gz]
   --clone          kept for compatibility: cloning the running medium is now
                    the default install method, with or without this flag
   --force          allow writing to a target that still has mounted partitions
-                   (it unmounts them first; the boot disk is always refused)
+                   (tries to unmount; continues even if that fails. Auto-selection
+                   stays conservative, so combine it with --disk /dev/sdX; the
+                   boot disk is always refused)
   --diag           print diagnostics (disks, boot disk, candidates, clone
                    source, tools) - run this when an install fails
   --disk <dev>     target disk, e.g. --disk /dev/sdb
@@ -1299,7 +1328,8 @@ EOF
   --no-menu       跳过菜单, 直接安装到内置硬盘(原一键安装行为)
   --change-ip     直接进入"修改 LAN 口 IP"功能(对应 quickstart 的改 IP)
   --clone         兼容写法: 现在"克隆安装"就是默认行为, 加不加都一样
-  --force         允许写入"仍有分区在挂载"的目标盘(会先尝试卸载; 启动盘永远拒绝)
+  --force         允许写入"仍有分区在挂载"的目标盘(会先尝试卸载, 卸不掉也继续;
+                  自动筛选永远保守, 所以要配合 --disk /dev/sdX 指定; 启动盘永远拒绝)
   --diag          打印诊断信息(磁盘/启动盘/候选判定/克隆源/工具), 装不上时先跑这个
   --disk <设备>   指定目标盘, 例如 --disk /dev/sdb
                   (多块盘且非交互环境下**必须**用它; 也接受
