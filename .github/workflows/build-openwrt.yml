@@ -98,7 +98,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential gawk gettext libncurses-dev unzip file wget rsync \
-            python3 zstd cpio
+            python3 zstd cpio mtools
 
       - name: Verify OAF kernel matches release kernel
         if: steps.release.outputs.build == 'true'
@@ -265,6 +265,42 @@ jobs:
             ls -l "$d"
           done
 
+      - name: Drop serial console from kernel cmdline (thin clients / Wyse 3040)
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # 官方 x86 镜像生成的内核命令行是:
+          #   console=tty1 console=ttyS0,115200n8
+          # 某些瘦客户机/嵌入式固件会谎报"存在串口", 内核把 ttyS0 注册成 console 后,
+          # printk 写这个不工作的 UART 会卡死 —— 现象就是 GRUB 之后停在
+          # "Booting OpenWrt" 再也不动(VirtualBox 正常, iStoreOS 的盘正常,
+          # 因为它的命令行里没有 ttyS0)。
+          # 上游已知问题: https://github.com/openwrt/openwrt/issues/22598
+          # (Dell Wyse 3040 / HP t640 / ESXi 均有复现, 目前 upstream 未修)
+          #
+          # 修法: 在 make image **之前** 把生成这半截命令行的那一行从 ImageBuilder 的
+          # 目标 Makefile 里删掉, 于是镜像里直接生成正确的 grub.cfg —— 不需要事后
+          # 拆镜像改文件/重压/重算 sha256sums, 风险最小。
+          # 只删内核命令行那一行; GRUB 自己的串口终端(serial/terminal_output)保留:
+          # 它不会卡, 还能让接了串口线的人在 GRUB 阶段看到菜单。
+          MK="${IB_DIR}/target/linux/x86/image/Makefile"
+          if [ ! -f "$MK" ]; then
+            echo "::error::找不到 $MK —— ImageBuilder 结构与预期不符"
+            exit 1
+          fi
+          # 上游若改了这里, 必须**显式失败**, 绝不能静默发一个带串口控制台的固件
+          if ! grep -q '^GRUB_CONSOLE_CMDLINE += console=' "$MK"; then
+            echo "::error::上游 Makefile 里没有预期的串口命令行, 补丁需要更新(不要静默放过)"
+            exit 1
+          fi
+          sed -i '/^GRUB_CONSOLE_CMDLINE += console=/d' "$MK"
+          if grep -q '^GRUB_CONSOLE_CMDLINE += console=' "$MK"; then
+            echo "::error::串口命令行仍在, 补丁没生效"
+            exit 1
+          fi
+          echo "==> 补丁后剩下的相关行(应只剩 console=tty1 与 GRUB 的串口终端):"
+          grep -nE 'GRUB_CONSOLE_CMDLINE|GRUB_TERMINALS|GRUB_SERIAL' "$MK"
+
       - name: Build firmware
         if: steps.release.outputs.build == 'true'
         env:
@@ -298,6 +334,58 @@ jobs:
             -j"$(nproc)"
           echo "==> 产物:"
           ls -lh bin/targets/x86/64/*.img.gz
+
+      - name: Verify grub.cfg has no serial console
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # 检查镜像里的内核命令行是否还带串口控制台(带的话瘦客户机会卡在 Booting)。
+          #
+          # 注意: 这里必须临时关掉 pipefail —— head/dd 读够就收工会让 gunzip 收到
+          # SIGPIPE(141), 开着 pipefail 会把整个管道判为失败, 于是 if 走 else 分支
+          # 报 "OK", 把真问题静默放过(本地实测踩到过)。所以改为: 允许管道被截断,
+          # 再对落盘的文件做检查, 并核对抠出来的 ESP 大小。
+          cd "${IB_DIR}/bin/targets/x86/64"
+          fail=0
+          for img in openwrt-*-combined-efi.img.gz; do
+            echo "-- $img"
+            TMPD=$(mktemp -d)
+            # ESP(分区1) 的起始扇区与扇区数: 从 GPT 项1 读(偏移 1024, StartingLBA +32,
+            # EndingLBA +40)。写成单行, 避免 YAML 块里出现顶格代码把 run: | 截断。
+            read -r START COUNT < <(gunzip -c "$img" | head -c 1048576 | python3 -c "import struct,sys; d=sys.stdin.buffer.read(); s,e=struct.unpack('<QQ', d[1056:1072]); print(s, e-s+1)")
+            ( set +o pipefail; gunzip -c "$img" | head -c 20971520 > "$TMPD/head.bin" ) || true
+            ( set +o pipefail; gunzip -c "$img" | dd of="$TMPD/esp.fat" bs=512 skip="$START" count="$COUNT" status=none ) || true
+            if [ ! -s "$TMPD/head.bin" ]; then
+              echo "::error::$img 开头读不出来, 无法验证"
+              fail=1; rm -rf "$TMPD"; continue
+            fi
+            EXPECT=$(( COUNT * 512 ))
+            GOT=$(wc -c < "$TMPD/esp.fat" 2>/dev/null || echo 0)
+            if [ "$GOT" != "$EXPECT" ]; then
+              echo "::error::$img 的 ESP 抠取不完整(${GOT}/${EXPECT} 字节), 后面的文件级检查不可信"
+              fail=1
+            fi
+            if grep -q 'console=ttyS0' "$TMPD/head.bin"; then
+              echo "::error::$img 里仍存在 console=ttyS0 —— 瘦客户机会卡在 Booting OpenWrt"
+              fail=1
+            else
+              echo "     [自检 OK] 开头 20 MiB 内没有串口控制台参数"
+            fi
+            if mcopy -i "$TMPD/esp.fat" ::/boot/grub/grub.cfg "$TMPD/grub.cfg" 2>/dev/null; then
+              grep -E '^[[:space:]]*linux ' "$TMPD/grub.cfg" | sed 's/^/     /'
+              if grep -q 'ttyS0' "$TMPD/grub.cfg"; then
+                echo "::error::$img 的 grub.cfg 里仍有 ttyS0"
+                fail=1
+              fi
+              grep -q 'console=tty1' "$TMPD/grub.cfg" \
+                || echo "::warning::$img 的 cmdline 里没有 console=tty1, 请确认显示输出正常"
+            else
+              echo "::warning::读不出 $img 的 ESP(grub.cfg), 只做了字节级检查"
+            fi
+            rm -rf "$TMPD"
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "==> 两个变体都已确认: 内核命令行不含串口控制台"
 
       - name: Tag built release
         if: steps.release.outputs.build == 'true'

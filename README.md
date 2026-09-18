@@ -26,6 +26,31 @@ GitHub Actions 在线自动构建 OpenWrt 25.12 x86_64 固件（基于官方 Ima
 
 防火墙为 OpenWrt 默认策略（WAN 拒绝入站，仅内网可管理）。
 
+## 瘦客户机启动卡在 "Booting OpenWrt"（Dell Wyse 3040 / HP t640 等）
+
+**已修**。官方 x86 镜像生成的内核命令行是：
+
+```
+console=tty1 console=ttyS0,115200n8
+```
+
+某些瘦客户机/嵌入式固件会**谎报"存在串口"**：内核把 `ttyS0` 注册成 console 之后，
+`printk` 写这个实际不工作的 UART 会卡住 —— 现象就是 GRUB 之后停在
+`Booting OpenWrt` 再也不动，连内核日志都出不来。
+
+- 上游已知问题：[openwrt/openwrt#22598](https://github.com/openwrt/openwrt/issues/22598)
+  （Dell Wyse 3040 / HP t640 / ESXi 都有复现；VirtualBox 正常，因为它的固件不会谎报串口；
+  iStoreOS 的盘也正常，因为它的命令行里没有 `ttyS0`）
+- 本固件在 `make image` **之前**删掉 ImageBuilder 里生成这半截命令行的那一行
+  （`target/linux/x86/image/Makefile`），于是镜像里直接生成干净的 `console=tty1`；
+  **GRUB 自己的串口终端保留**，接了串口线的人仍能在 GRUB 阶段看到菜单
+- 构建末尾有自检：把镜像的 ESP 分区抠出来读真正的 `/boot/grub/grub.cfg`，
+  一旦又出现 `ttyS0` 就让构建**失败**，不会悄悄发出一个会卡的固件
+- 如果你确实想要内核串口输出：在 GRUB 菜单按 `e`，给启动项补回
+  `console=ttyS0,115200n8` 即可（只对这一次启动生效）
+- 刷**旧版镜像**（本次修复之前构建的）遇到这个卡顿：同样按 `e` 删掉
+  `console=ttyS0,115200n8` 再按 F10 就能启动
+
 ## 为什么用 ImageBuilder 而不是源码编译
 
 原先的 `make world` 流程每次都从源码编译整个工具链，其中 `tools/llvm-bpf` 会编译
