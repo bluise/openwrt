@@ -516,13 +516,23 @@ fw_not_found_fallback() {
 
   # 没有终端(--no-menu/脚本里跑): 只给可照抄的命令, 不提问
   if [ ! -t 0 ] && [ ! -t 1 ]; then
+    log_warn "$(zh_en '如果是用 U 盘启动的, 可以不走镜像文件, 直接克隆当前介质:' \
+                      'If you booted from USB, you can clone the running medium instead:')"
+    log_warn "  openwrt-install --no-menu --clone"
     name=$(fw_asset_name ext4 2>/dev/null || true)
     [ -n "$name" ] || name='openwrt-<版本>-x86-64-generic-ext4-combined-efi.img.gz'
-    log_warn "$(zh_en '请先准备镜像, 例如在这台设备上直接下载:' 'Prepare an image first, e.g. download it here:')"
+    log_warn "$(zh_en '或者先准备镜像, 例如在这台设备上直接下载:' 'Or prepare an image, e.g. download it here:')"
     log_warn "  curl -L -o /root/${name} ${FW_DL_BASE}/${name}"
     log_warn "$(zh_en '然后带上路径重跑: openwrt-install --no-menu --fw /root/<上面那个文件名>' \
                       'then re-run: openwrt-install --no-menu --fw /root/<the file above>')"
     return 1
+  fi
+
+  # (0) 首选: 离线克隆(不需要镜像文件, 不需要网络) —— 从 U 盘启动时这一步就够了
+  if [ -z "$FORCE_CLONE" ]; then
+    if clone_offer; then
+      return 0
+    fi
   fi
 
   # (1) 全盘扫一遍, 列出候选让用户挑(带编号), 也允许直接输完整路径
@@ -593,16 +603,113 @@ image_raw_size() {   # 未压缩镜像大小(字节), 非 gzip 则用文件本�
   wc -c < "$1" 2>/dev/null | tr -d ' '
 }
 
+# ---------------------------------------------------------------------------
+# 离线"克隆安装": 把当前正在运行的介质(U 盘)整盘复制到目标盘
+#
+# 为什么需要它: 我们用 dd 写出来的启动 U 盘里**只有系统本身, 没有 .img.gz 文件**
+# (ESP 才 16 MiB 装不下, rootfs 是只读 squashfs 也放不下), 所以原来只能
+# "先找到镜像文件, 找不到就联网下载"。而瘦客户机/路由器这种场景经常没有网络 ——
+# 于是根本装不了。
+#
+# iStoreOS 的 quickstart "Install X86" 就是这么干的(源码 istoreos/quickstart
+# backend/cmd/backend/prompt.go): 直接把它自己运行的那块盘 dd 到目标盘,
+# 既不需要镜像文件也不需要网络。这里做同样的事。
+#
+# 拷贝长度只到"最后一个分区的末尾 + 备份 GPT", 而不是整块 U 盘(32G 的 U 盘
+# 不会傻copy 32G), 目标盘只要比这个长度大就行。
+clone_src_disk() {   # 输出当前运行介质的整盘名(如 sda)
+  d=$(first_word $BOOT_DISKS)
+  [ -n "$d" ] || d=$(find_boot_disks 2>/dev/null | awk '{print $1}')
+  [ -n "$d" ] || return 1
+  echo "$d"
+}
+
+first_word() { set -- $1; echo "${1:-}"; }
+
+clone_src_bytes() {   # $1=源盘设备(如 /dev/sda) -> 需要复制的字节数
+  dev=$1
+  maxend=0
+  for idx in 1 2 3 4 5 6 7 8; do
+    # 同上: 必须 || true, 否则分区数不足 8 个时 set -e 会直接退出
+    r=$(gpt_part_range "$dev" "$idx" || true)
+    [ -n "$r" ] || continue
+    e=${r#* }
+    [ "$e" -gt "$maxend" ] 2>/dev/null && maxend=$e
+  done
+  if [ "$maxend" -le 0 ] 2>/dev/null; then
+    # 没有 GPT(例如 MBR 布局): 退化为整盘大小
+    tot=$(disk_sectors "$dev")
+    [ -n "$tot" ] && [ "$tot" -gt 0 ] 2>/dev/null || return 1
+    echo $(( tot * 512 ))
+    return 0
+  fi
+  # 末尾再留 34 个扇区(备份 GPT)
+  echo $(( (maxend + 34) * 512 ))
+}
+
+# 算出源盘与复制长度(设定 CLONE_SRC / CLONE_BYTES), 供下面两条路径共用
+clone_resolve() {
+  s=$(clone_src_disk) || {
+    log_err "$(zh_en '认不出当前运行的介质(启动盘), 没法克隆' \
+                      'Cannot identify the running medium (boot disk), cannot clone')"
+    log_warn "$(zh_en '请改用镜像文件: openwrt-install --fw /path/to/openwrt-*.img.gz' \
+                      'Use an image file instead: openwrt-install --fw /path/to/openwrt-*.img.gz')"
+    return 1
+  }
+  if [ "$s" = "$(basename "$TARGET")" ]; then
+    log_err "$(zh_en '源盘和目标盘是同一块($s), 拒绝' "Source and target are the same disk ($s) - refusing")"
+    return 1
+  fi
+  b=$(clone_src_bytes "${CLONE_SRC_PATH_OVERRIDE:-/dev/$s}") || {
+    log_err "$(zh_en '读不出源盘分区表, 无法确定复制长度' 'Cannot read the source partition table')"
+    return 1
+  }
+  CLONE_SRC=$s
+  CLONE_SRC_PATH=${CLONE_SRC_PATH_OVERRIDE:-/dev/$s}
+  CLONE_BYTES=$b
+  return 0
+}
+
+# 非交互路径(--clone): 直接准备好
+clone_prepare() {
+  clone_resolve || return 1
+  CLONE=1
+  log_info "$(zh_en "离线克隆: $CLONE_SRC_PATH -> $TARGET (复制 $(bytes_to_mib "$CLONE_BYTES") MiB)" \
+                    "Offline clone: $CLONE_SRC_PATH -> $TARGET (copying $(bytes_to_mib "$CLONE_BYTES") MiB)")"
+  return 0
+}
+
+# 交互路径: 问用户要不要用离线克隆(找不到镜像文件时的首选)
+clone_offer() {
+  clone_resolve || return 1
+  if confirm "$(zh_en '离线克隆安装' 'Offline clone install')" \
+     "$(zh_en "这台设备上没找到固件镜像文件, 但你现在是从 U 盘启动的 ——\n可以直接把当前这套系统整盘复制到目标盘, **不需要镜像文件, 也不需要联网**。\n\n源盘  : $CLONE_SRC_PATH\n目标盘: $TARGET\n复制  : $(bytes_to_mib "$CLONE_BYTES") MiB (会清空目标盘)\n\n用这个方法安装吗?" \
+                "No image file was found, but you booted from USB -\nthe running system can be cloned to the target disk.\n**No image file and no network needed.**\n\nFrom: $CLONE_SRC_PATH\nTo:   $TARGET\nCopy: $(bytes_to_mib "$CLONE_BYTES") MiB (target will be erased)\n\nUse this method?")"; then
+    CLONE=1
+    return 0
+  fi
+  return 1
+}
+
 check_target_size() {
-  IMG_BYTES=$(image_raw_size "$FW")
+  if [ "$CLONE" = "1" ]; then
+    IMG_BYTES=$CLONE_BYTES
+  else
+    IMG_BYTES=$(image_raw_size "$FW")
+  fi
   [ -n "$IMG_BYTES" ] && [ "$IMG_BYTES" -gt 0 ] 2>/dev/null || return 0
   T_SEC=$(disk_sectors "$TARGET")
   [ -n "$T_SEC" ] && [ "$T_SEC" -gt 0 ] 2>/dev/null || return 0
   T_BYTES=$(( T_SEC * 512 ))
-  log_info "$(zh_en "镜像(未压缩) $(bytes_to_mib "$IMG_BYTES") MiB   目标盘 $(bytes_to_mib "$T_BYTES") MiB" \
-                    "Image (uncompressed) $(bytes_to_mib "$IMG_BYTES") MiB   target disk $(bytes_to_mib "$T_BYTES") MiB")"
+  if [ "$CLONE" = "1" ]; then
+    log_info "$(zh_en "克隆内容 $(bytes_to_mib "$IMG_BYTES") MiB (源盘 /dev/$CLONE_SRC)   目标盘 $(bytes_to_mib "$T_BYTES") MiB" \
+                      "Clone size $(bytes_to_mib "$IMG_BYTES") MiB (from /dev/$CLONE_SRC)   target disk $(bytes_to_mib "$T_BYTES") MiB")"
+  else
+    log_info "$(zh_en "镜像(未压缩) $(bytes_to_mib "$IMG_BYTES") MiB   目标盘 $(bytes_to_mib "$T_BYTES") MiB" \
+                      "Image (uncompressed) $(bytes_to_mib "$IMG_BYTES") MiB   target disk $(bytes_to_mib "$T_BYTES") MiB")"
+  fi
   if [ "$T_BYTES" -lt "$IMG_BYTES" ]; then
-    log_err "$(zh_en "目标盘太小, 装不下镜像!" "Target disk is too small for the image!")"
+    log_err "$(zh_en "目标盘太小, 装不下!" "Target disk is too small!")"
     log_warn "$(zh_en "需要至少 $(bytes_to_mib "$IMG_BYTES") MiB, 而 $TARGET 只有 $(bytes_to_mib "$T_BYTES") MiB。" \
                       "Needs at least $(bytes_to_mib "$IMG_BYTES") MiB but $TARGET has only $(bytes_to_mib "$T_BYTES") MiB.")"
     log_warn "$(zh_en '请换一块更大的盘/虚拟磁盘, 或改用更小的镜像。' \
@@ -615,8 +722,13 @@ check_target_size() {
 # ---------- 3. 倒计时 ----------
 countdown() {
   # 这条警告是最关键的安全提示, 英文界面下也必须看得懂
-  log_warn "$(zh_en "5秒后将把 $FW 写入 $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
-                    "Writing $FW to $TARGET  ($(disk_desc "$(basename "$TARGET")")) in 5 seconds")"
+  if [ "$CLONE" = "1" ]; then
+    log_warn "$(zh_en "5秒后把 $CLONE_SRC_PATH 整盘克隆到 $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
+                      "Cloning $CLONE_SRC_PATH to $TARGET  ($(disk_desc "$(basename "$TARGET")")) in 5 seconds")"
+  else
+    log_warn "$(zh_en "5秒后将把 $FW 写入 $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
+                      "Writing $FW to $TARGET  ($(disk_desc "$(basename "$TARGET")")) in 5 seconds")"
+  fi
   log_warn "$(zh_en "该操作会清空 $TARGET 上的所有数据! (Ctrl+C 可取消)" \
                     "ALL DATA on $TARGET will be erased! (Ctrl+C to abort)")"
   i=5
@@ -698,7 +810,9 @@ find_rootfs_partition() {
   dev="$1"
   BEST_IDX=""; BEST_START=""; BEST_SIZE=""; BEST_FS=""
   for idx in 1 2 3 4 5 6 7 8; do
-    r=$(gpt_part_range "$dev" "$idx")
+    # 注意 || true: set -e 下 "赋值+命令替换" 若命令失败会直接退出脚本 ——
+    # 分区数少于 8 个时 gpt_part_range 返回非 0, 不加这个守卫整个程序就断了。
+    r=$(gpt_part_range "$dev" "$idx" || true)
     [ -n "$r" ] || continue
     s=${r% *}; e=${r#* }
     sz=$(( e - s + 1 ))
@@ -1109,6 +1223,7 @@ text_menu() {
   6) $(zh_en '显示扩容命令(如需要)' 'Show resize commands (if needed)')
   7) $(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')
   8) $(zh_en '诊断(装不上时先看这个)' 'Diagnose (run this when install fails)')
+  9) $(zh_en '克隆安装(从当前介质, 不需要镜像/网络)' 'Clone install (from running medium, no image/network)')
   0) $(zh_en '退出 (输入 q 也可以)' 'Quit (or type q)')
 ========================================
 EOF
@@ -1148,6 +1263,12 @@ EOF
         printf '%s' "$(zh_en '按回车继续...' 'Press Enter to continue...')"
         read -r _x || true
         ;;
+      9)
+        OLD_FC=$FORCE_CLONE
+        FORCE_CLONE=1
+        do_install || true
+        FORCE_CLONE=$OLD_FC
+        ;;
       0|q|Q|quit|QUIT|exit|EXIT|"") echo "$(zh_en '已退出' 'Bye')"; return 0 ;;
       *) echo "$(zh_en "无效编号: $N" "Invalid input: $N")" ;;
     esac
@@ -1169,6 +1290,7 @@ main_menu() {
       "6" "$(zh_en '显示扩容命令(如需要)' 'Show resize commands (if needed)')" \
       "7" "$(zh_en '设置网口模式(单网卡/双网卡)' 'Set NIC mode (single/dual)')" \
       "8" "$(zh_en '诊断(装不上时先看这个)' 'Diagnose (run this when install fails)')" \
+      "9" "$(zh_en '克隆安装(从当前介质, 不需要镜像/网络)' 'Clone install (from running medium, no image/network)')" \
       "0" "$(zh_en '退出' 'Quit')" \
       3>&1 1>&2 2>&3) || return 0
     case "$CHOICE" in
@@ -1230,6 +1352,13 @@ main_menu() {
         rm -f "$TMPF"
         msg "$(zh_en '诊断信息' 'Diagnostics')" "${TXT:-$(zh_en '未获取到信息' 'no information')}"
         ;;
+      9)
+        # 克隆安装: 直接把当前介质整盘复制到目标盘(不需要镜像文件/网络)
+        OLD_FC=$FORCE_CLONE
+        FORCE_CLONE=1
+        do_install || true
+        FORCE_CLONE=$OLD_FC
+        ;;
       0|q|Q|quit|"") return 0 ;;
     esac
   done
@@ -1240,15 +1369,26 @@ do_install() {
   # 先把固件路径存进变量: find_target_disk 内部会用 set -- 拼 whiptail 参数,
   # 不能让它依赖调用者的位置参数("$@")。
   FW_PATH=$1
+  CLONE=""
   find_target_disk || return 1
-  find_firmware "$FW_PATH" || return 1
+  if [ "$FORCE_CLONE" = "1" ]; then
+    # --clone / 菜单里选"克隆安装": 不走镜像文件
+    clone_prepare || return 1
+  else
+    find_firmware "$FW_PATH" || return 1
+  fi
   check_target_size || return 1
   countdown
 
-  log_info "$(zh_en '解压并写入镜像...' 'Decompressing and writing the image...')"
-  if command -v gunzip >/dev/null 2>&1; then
+  if [ "$CLONE" = "1" ]; then
+    log_info "$(zh_en "正在克隆 $CLONE_SRC_PATH -> $TARGET ..." "Cloning $CLONE_SRC_PATH -> $TARGET ...")"
+    # 只复制到最后一个分区末尾(含备份 GPT), 不整盘拷贝 —— 32G 的 U 盘不会傻copy 32G
+    dd if="$CLONE_SRC_PATH" of="$TARGET" bs=4M count="$(( CLONE_BYTES / 4194304 + 1 ))" conv=fsync
+  elif command -v gunzip >/dev/null 2>&1; then
+    log_info "$(zh_en '解压并写入镜像...' 'Decompressing and writing the image...')"
     gunzip -c "$FW" | dd of="$TARGET" bs=4M conv=fsync
   else
+    log_info "$(zh_en '写入镜像...' 'Writing the image...')"
     dd if="$FW" of="$TARGET" bs=4M conv=fsync
   fi
   sync
@@ -1258,6 +1398,12 @@ do_install() {
 
   log_info "$(zh_en '安装完成! 请拔掉U盘重启, 首次启动约需2-3分钟.' \
                     'Done! Unplug the USB stick and reboot; first boot takes 2-3 minutes.')"
+  if [ "$CLONE" = "1" ]; then
+    # 克隆出来的是源盘的逐字节副本, 所以两块盘的分区 UUID 是一样的 ——
+    # 同时插着两块盘开机时引导可能挑到 U 盘那份, 所以这句必须强调。
+    log_warn "$(zh_en '克隆安装: 目标盘与源盘的分区 UUID 相同, 重启前务必拔掉 U 盘!' \
+                      'Clone install: target has the same partition UUIDs as the source - remove the USB stick before rebooting!')"
+  fi
 
   # 这里是"重启后怎么进去"的提示, 必须按当前 uci 配置来读。
   # 原先硬编码 "10.0.0.1 (LAN口 eth1)": 一旦用菜单 7 改过网口模式,
@@ -1283,6 +1429,9 @@ Usage: openwrt-install [options] [firmware.img.gz]
   (no args)        interactive menu (recommended)
   --no-menu        skip the menu, install straight to the internal disk
   --change-ip      only change the LAN IP
+  --clone          install by cloning the running medium (the USB stick you
+                   booted from) onto the target disk - no firmware image file
+                   and no network needed (same as menu item 9)
   --diag           print diagnostics (disks, boot disk, candidates, firmware
                    search, tools) - run this when an install fails
   --disk <dev>     target disk, e.g. --disk /dev/sdb
@@ -1307,6 +1456,7 @@ Target disk rules:
 Examples:
   openwrt-install
   openwrt-install --en
+  openwrt-install --clone
   openwrt-install --diag
   openwrt-install --no-menu
   openwrt-install --no-menu /mnt/sda1/openwrt-*.img.gz
@@ -1321,6 +1471,8 @@ EOF
   (无参数)        显示交互式菜单 (推荐)
   --no-menu       跳过菜单, 直接安装到内置硬盘(原一键安装行为)
   --change-ip     直接进入"修改 LAN 口 IP"功能(对应 quickstart 的改 IP)
+  --clone         克隆安装: 把当前运行的介质(你启动用的 U 盘)整盘复制到目标盘
+                  —— 不需要固件镜像文件, 也不需要联网(等价于菜单里的第 9 项)
   --diag          打印诊断信息(磁盘/启动盘/候选判定/固件搜索/工具), 装不上时先跑这个
   --disk <设备>   指定目标盘, 例如 --disk /dev/sdb
                   (多块盘且非交互环境下**必须**用它; 也接受
@@ -1343,6 +1495,8 @@ EOF
 示例:
   openwrt-install                                  # 菜单模式
   openwrt-install --en                             # 英文菜单(终端不支持中文时)
+  openwrt-install --clone
+  openwrt-install --clone                          # 离线克隆安装(无镜像/无网络)
   openwrt-install --diag                           # 诊断, 看为什么装不上
   openwrt-install --no-menu                        # 一键安装(自动找固件/目标盘)
   openwrt-install --no-menu /mnt/sda1/xxx.img.gz   # 指定固件
@@ -1355,6 +1509,7 @@ main() {
   MODE=menu
   FW_ARG=""
   FORCE_DISK=${OPENWRT_TARGET_DISK:-}
+  FORCE_CLONE=""
 
   # 先按环境定一次语言(让解析阶段的报错也是对的), 解析完再按 --en/--zh 重定一次
   ui_setup
@@ -1366,6 +1521,7 @@ main() {
       --no-menu) MODE=install ;;
       --change-ip) MODE=changeip ;;
       --diag|--check) MODE=diag ;;
+      --clone) MODE=install; FORCE_CLONE=1 ;;
       --en|--english) UI_FORCE=en ;;
       --zh|--chinese) UI_FORCE=zh ;;
       --disk)
