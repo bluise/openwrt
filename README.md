@@ -510,6 +510,14 @@ DietPi 论坛里同为 Wyse 3040 + AW-CM389MA 的实例。认证所需的 `wpad`
 > 而内核已内置 `sdhci-pci`/`mmc_core`，所以**唯一缺的就是驱动没被自动加载**：
 > 加载后立刻出现 `mlan0`，无线可用。
 >
+> **还缺一步（很重要）**：x86/64 的默认包集**不含** `wpad`/`hostapd`/`wpa_supplicant`，
+> 镜像里只有 `hostapd-common`（仅提供 `/etc/init.d/wpad` 和公共文件）。表现是：
+> 无线接口能认出来（`mlan0`），但 LuCI 配 AP/连接时会提示
+> "需要安装 wpad / hostapd / wpa_supplicant"，而且实际也连不上。
+> 已加入 `wpad-mbedtls`（完整版，合并了 hostapd + wpa_supplicant 两种角色，
+> 支持 802.11s mesh、802.11r/k/v、WPA2/WPA3），一个包同时满足这三个提示。
+> 已在镜像里核实：`/usr/sbin/{wpad,hostapd,wpa_supplicant}` 全部存在。
+>
 > 注意：`kmod-mwifiex-sdio` 这个包**不会**往 `/etc/modules.d/` 写自动加载条目
 > （镜像里能看到 `mmc`、`sdhci`、`mt7921e`，唯独没有它），所以本仓库额外放了
 > `files/etc/modules.d/mwifiex-sdio` 让驱动**开机自动加载**；临时手动加载：
