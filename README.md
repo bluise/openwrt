@@ -484,3 +484,32 @@ openwrt-install --boot-order        # 把当前启动的这块盘(优盘)排到�
   dd if=/dev/zero of=/dev/mmcblk1 bs=1M count=16 conv=fsync   # 清掉 GPT+ESP
   sync; reboot            # 内置盘没有可引导的东西了, 固件只能走优盘
   ```
+
+### Dell Wyse 3040 的无线网卡（已集成驱动）
+
+Wyse 3040 的无线模块是 **Marvell 88W8897**（模块型号 **AzureWave AW-CM389MA**），
+是 **SDIO** 卡不是 PCIe 卡，所以固件里需要的不只是 WiFi 驱动，还要 MMC/SDIO 主机支持：
+
+| 包 | 作用 |
+|---|---|
+| `kmod-mwifiex-sdio` | Marvell mwifiex 驱动（SDIO/88W8897） |
+| `mwifiex-sdio-firmware` | 驱动固件 `mrvl/sd8897_uapsta.bin` |
+| `kmod-mmc` | MMC/SDIO 核心（mwifiex-sdio 依赖） |
+| `kmod-sdhci` | Atom（Cherry Trail）的 SD/SDIO 主机控制器 |
+| `iwinfo` / `iw` | 无线诊断（信号、加密、接口能力） |
+
+依据：[OpenWrt 论坛专帖（Wyse 3040 + 88W8897）](https://forum.openwrt.org/t/dell-wyse-3040-with-marvell-88w8897-wifi-card/177119)、
+DietPi 论坛里同为 Wyse 3040 + AW-CM389MA 的实例。认证所需的 `wpad`/`hostapd` 基础本就在默认包里。
+
+**装好后怎么确认**：
+
+```sh
+ls /sys/bus/sdio/devices/                 # 有设备说明 SDIO 卡被识别
+dmesg | grep -i -E "mwifiex|sdio"         # 驱动加载与固件下载日志
+iw dev                                    # 应出现 mlan0(不是 wlan0)
+iwinfo                                    # 接口与加密方式
+```
+LuCI 里是 **网络 → 无线**（`luci-mod-network` 已随 luci 装好）。
+
+> 若你的机器插的不是这块卡（比如自己加的 PCIe M.2 网卡），把 `lspci -nn | grep -i net`
+> 和 `lsusb` 的输出发我，改一行包名即可。

@@ -87,3 +87,22 @@ e2fsprogs
 # ---- UEFI 启动顺序(--boot-order): 让主板从优盘而不是内置盘启动 ----
 # 官方源里有 efibootmgr(依赖 efivar)。注意: 它只能在 UEFI 启动的系统里用。
 efibootmgr
+
+# ============================================================================
+# Dell Wyse 3040 的无线网卡: Marvell 88W8897(AzureWave AW-CM389MA, SDIO 接口)
+# ----------------------------------------------------------------------------
+# 依据:
+#   * OpenWrt 论坛专帖 "Dell Wyse 3040 with Marvell 88W8897 WiFi card"
+#     https://forum.openwrt.org/t/dell-wyse-3040-with-marvell-88w8897-wifi-card/177119
+#   * DietPi 论坛里同为 Wyse 3040 + AW-CM389MA 的实例(接口名 mlan0, 即 mwifiex)
+# 这块卡是 SDIO 卡(不是 PCIe), 所以除了 WiFi 驱动还得有 MMC/SDIO 主机支持。
+# 官方 x86/64 的 kmods 源里这几个包都有(已核对 25.12.5 / 6.12.94)。
+# ============================================================================
+kmod-mwifiex-sdio        # Marvell mwifiex 驱动(SDIO, 88W8897; 接口名 mlan0)
+mwifiex-sdio-firmware    # 驱动要的固件(mrvl/sd8897_uapsta.bin)
+kmod-mmc                 # MMC/SDIO 核心(mwifiex-sdio 的依赖)
+kmod-sdhci               # Atom(Cherry Trail)上的 SD/SDIO 主机控制器
+
+# 无线诊断(加密认证所需的 wpad/hostapd 基础已随默认包进来, 不再重复列)
+iwinfo                   # iwinfo: 看信号强度/加密方式/关联状态
+iw                       # iw dev / iw list: 看接口与设备能力
