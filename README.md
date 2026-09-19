@@ -504,8 +504,13 @@ DietPi 论坛里同为 Wyse 3040 + AW-CM389MA 的实例。认证所需的 `wpad`
 
 **装好后怎么确认**：
 
+> 注意：`kmod-mwifiex-sdio` 这个包**不会**往 `/etc/modules.d/` 写自动加载条目
+> （镜像里能看到 `mmc`、`sdhci`、`mt7921e`，唯独没有它），所以本仓库额外放了
+> `files/etc/modules.d/mwifiex-sdio` 让驱动**开机自动加载**；临时手动加载：
+> `modprobe mwifiex_sdio && sleep 3 && iw dev`
+
 ```sh
-ls /sys/bus/sdio/devices/                 # 有设备说明 SDIO 卡被识别
+ls /sys/bus/devices/ 2>/dev/null >/dev/null; ls /sys/bus/sdio/devices/   # 有设备说明 SDIO 卡被识别
 ls /lib/firmware/mrvl/                    # 应有 sd8897_uapsta.bin(8897 专用)
 dmesg | grep -i -E "mwifiex|sdio"         # 驱动加载与固件下载日志(应能看到 firmware download 成功)
 iw dev                                    # 应出现 mlan0(不是 wlan0)
