@@ -201,7 +201,21 @@ jobs:
         run: |
           set -euo pipefail
           # 来源1: scripts/packages.list (官方源里的包)
-          mapfile -t PKGS < <(grep -vE '^[[:space:]]*(#|$)' scripts/packages.list)
+          # 解析清单: 去掉整行注释、**行内注释**、行尾空白与 CR。
+          # 教训: 曾经在包名后写了行内注释(`kmod-xxx  # 说明`), 结果整串被当成包名,
+          # 构建时报 "bash: syntax error near unexpected token '('" —— 必须在解析层兜住。
+          mapfile -t PKGS < <(sed -e 's/#.*$//' -e 's/[[:space:]]*$//' -e 's/\r$//' scripts/packages.list \
+                              | grep -vE '^[[:space:]]*$')
+          # 自检: 包名只允许 [A-Za-z0-9._+-]
+          bad=""
+          for pk in "${PKGS[@]}"; do
+            case "$pk" in *[!A-Za-z0-9._+-]*) bad="$bad $pk" ;; esac
+          done
+          if [ -n "$bad" ]; then
+            echo "::error::packages.list 里有非法包名:$bad"
+            exit 1
+          fi
+          echo "==> 解析出 ${#PKGS[@]} 个包名, 全部合法"
           # 来源2: 从第三方 release 拉取的预编译包(它们不在 packages.list 里!)
           #   kmod-oaf / appfilter 来自 OAF 的 per-target tar.gz
           #   luci-app-oaf / luci-i18n-oaf-zh-cn / luci-app-openclash 来自各自 release 的 .apk
