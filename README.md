@@ -217,10 +217,13 @@ openwrt-install --en     # 或 OPENWRT_UI=en openwrt-install
 - 目标盘里所有引用旧 UUID 的地方会一起改掉：ESP 上的 `/boot/grub/grub.cfg`
   （`root=PARTUUID=...`，含 failsafe 那行）以及 `/etc/config/fstab` 之类按 UUID 挂载的配置
   —— 所以**两块盘各自引导到自己的系统**，互不干扰（`--same-uuid` 可退回"逐字节等价克隆"）
-- **ext4 版**：rootfs 分区扩到盘尾，装完自动 `e2fsck -f -y` + `resize2fs` 占满整盘
-  （例如 7.2 GB 的内置盘 → 根文件系统约 7.3 GB 可用）
-- **squashfs 版**：rootfs 只读，保持镜像里的 2048 MiB，剩余空间不分配
-  （与直接刷镜像的行为一致）
+- **整盘安装**：装到内置盘时不会只占 2 GiB ——
+  - **ext4 版**：rootfs 分区扩到盘尾，装完 `e2fsck -f -y` + `resize2fs`，并**自证**
+    （日志会打印"根分区 X MiB / 根文件系统 Y MiB / ✅ 整盘安装"；若文件系统没扩上会明确告警并给出
+    `resize2fs` 命令）
+  - **squashfs 版**：根是只读的扩不了，于是把剩余空间建成一个 `rootfs_data` 分区
+    （OpenWrt 首次启动把它格式化/挂载成可写层 `/overlay`），整块盘同样不浪费
+  - 例如 7.2 GB 的内置盘 → 约 7.3 GB 可用于根文件系统
 - **装完建议拔掉 U 盘再启动**：现在目标盘有自己的 UUID、`grub.cfg` 也指向它自己，
   两块盘同时插着不会互相抢根分区；但机器的 uEFI 可能仍优先从内置盘启动
   （想用优盘启动时开机按 **F12** 选它）

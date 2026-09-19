@@ -29,7 +29,7 @@ log_err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # 版本号: 每次改动都换 —— 日志第一行就会打印, 用来判断机器上/镜像里跑的到底是哪一版
 # (真机上出过"脚本改了但跑的还是旧版"的扯皮, 有这一行就不用猜)
-INSTALL_VER="2026-09-19.6"
+INSTALL_VER="2026-09-19.7"
 INSTALL_MODE_ZH="分区复制安装: 只复制系统分区 + 重建分区表 + 目标盘独立 UUID"
 INSTALL_MODE_EN="partition-copy install: copies only the system partitions, rebuilds the target table and gives it fresh UUIDs"
 
@@ -611,6 +611,9 @@ disk_label_id() { sfdisk -d "$1" 2>/dev/null | sed -n 's/^label-id: *//p' | head
 # 是不是块设备。单独一个函数便于测试覆盖(文件目标/模拟环境)。
 is_block_dev() { [ -b "${1:-}" ]; }
 
+# 分区的扇区数(内核视角)。同样便于测试覆盖。
+part_sectors() { cat "/sys/class/block/$(basename "$1")/size" 2>/dev/null | tr -d ' '; }
+
 # 生成一个 v4 UUID。busybox 里没有 uuidgen, 所以自己从 /dev/urandom 取 16 字节拼。
 gen_uuid() {
   h=$(od -An -tx1 -N 16 /dev/urandom 2>/dev/null | tr -d ' \n')
@@ -890,8 +893,8 @@ last-lba: $tlast
   done < "$TABLE_FILE"
   rm -f "$TABLE_FILE"
 
-  log_info "$(zh_en "写入 $tgt 的分区表 (start/uuid 与源盘一致, PARTUUID 不变)..." \
-                    "Writing the partition table of $tgt (same start/uuid as the source, PARTUUID unchanged)...")"
+  log_info "$(zh_en "写入 $tgt 的分区表 (分区号/起点/类型照抄源盘, UUID 用新生成的)..." \
+                    "Writing the partition table of $tgt (same numbers/start/type, freshly generated UUIDs)...")"
   if ! printf '%s' "$script" | sfdisk --force "$tgt"; then
     log_err "$(zh_en 'sfdisk 写分区表失败' 'sfdisk failed to write the partition table')"
     return 1
@@ -962,6 +965,41 @@ rewrite_target_uuids() {
   return 0
 }
 
+# 整盘安装的"另一半": squashfs 版的根是只读的, 扩不了 —— 那就把剩下的空间
+# 建成一个 rootfs_data 分区(OpenWrt 首次启动会把它格式化/挂载成可写层 /overlay),
+# 这样整块盘也不会浪费。ext4 版不需要(它的可写层就在 rootfs 里面)。
+add_tail_data_partition() {
+  [ "$CLONE_ROOT_FS" = "ext4" ] && return 0
+  # 找到目标盘上最后一个分区的末尾(我们自己的分区, 用计划里的信息)
+  end=0
+  while read -r sfx st sz cp ty uu at pn; do
+    [ -n "$st" ] || continue
+    e=$(( st + sz ))
+    if [ "$e" -gt "$end" ]; then end=$e; fi
+    :
+  done < "$PLAN_FILE"
+  [ "$end" -gt 0 ] || return 0
+  tsec=$(disk_sectors "$TARGET")
+  [ -n "$tsec" ] && [ "$tsec" -gt 0 ] 2>/dev/null || return 0
+  tlast=$(( tsec - 34 ))
+  bstart=$end
+  # 与已有分区对齐一下(1 MiB)
+  bstart=$(( (bstart + 2047) / 2048 * 2048 ))
+  [ "$bstart" -lt "$tlast" ] || { log_info "$(zh_en '目标盘没有剩余空间' 'No free space left on the target')"; return 0; }
+  bsize=$(( tlast - bstart + 1 ))
+  [ "$bsize" -gt 4096 ] || return 0
+  log_info "$(zh_en "squashfs 版: 把剩余 $(bytes_to_mib $(( bsize * SECTOR ))) MiB 建成 rootfs_data(可写层)" \
+                    "squashfs variant: turning the remaining $(bytes_to_mib $(( bsize * SECTOR ))) MiB into rootfs_data (writable layer)")"
+  if printf 'start=%s, size=%s, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="rootfs_data"\n' "$bstart" "$bsize" \
+       | sfdisk --force --append --no-reread "$TARGET" >/dev/null 2>&1; then
+    partx -u "$TARGET" >/dev/null 2>&1 || true
+    log_info "$(zh_en '已创建 rootfs_data 分区(首次启动自动格式化)' 'rootfs_data partition created (formatted on first boot)')"
+  else
+    log_warn "$(zh_en '创建 rootfs_data 分区失败(不影响启动)' 'Failed to create the rootfs_data partition (boot is unaffected)')"
+  fi
+  return 0
+}
+
 # 装完之后: ext4 版的 rootfs 分区已被扩到盘尾, 这里把文件系统也扩上去。
 # 复制自"正在运行"的文件系统, 先 e2fsck -f -y 修一遍(重放日志)再 resize2fs。
 grow_target_rootfs() {
@@ -971,7 +1009,7 @@ grow_target_rootfs() {
   command -v resize2fs >/dev/null 2>&1 || { log_warn "$(zh_en '固件里没有 resize2fs, 跳过扩容' 'resize2fs not in firmware, skipping resize')"; return 0; }
   partx -u "$TARGET" >/dev/null 2>&1 || true
   sleep 1
-  if [ ! -b "$pdev" ]; then
+  if ! is_block_dev "$pdev"; then
     log_warn "$(zh_en "内核还没生成 $pdev, 跳过扩容(重启后手动: e2fsck -fy $pdev; resize2fs $pdev)" \
                       "kernel has not created $pdev yet, skipping resize (after reboot: e2fsck -fy $pdev; resize2fs $pdev)")"
     return 0
@@ -981,7 +1019,7 @@ grow_target_rootfs() {
   # 改别的文件系统了 —— 所以先比对 sysfs 里的实际扇区数, 不符就放弃扩容。
   tsec=$(disk_sectors "$TARGET")
   pexpect=$(( tsec - 34 - CLONE_ROOT_START + 1 ))
-  pact=$(cat "/sys/class/block/$(basename "$pdev")/size" 2>/dev/null | tr -d ' ' || true)
+  pact=$(part_sectors "$pdev")
   if [ -n "$pact" ] && [ "$pact" != "$pexpect" ]; then
     log_warn "$(zh_en "$pdev 还是旧尺寸($pact 扇区, 应为 $pexpect): 内核没重读分区表, 跳过扩容; 重启后执行 e2fsck -fy $pdev && resize2fs $pdev" \
                       "$pdev still has the old size ($pact sectors, expected $pexpect): the kernel did not re-read the table, skipping resize; after reboot run e2fsck -fy $pdev && resize2fs $pdev")"
@@ -991,15 +1029,35 @@ grow_target_rootfs() {
   rc=0
   e2fsck -f -y "$pdev" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -ge 4 ] 2>/dev/null; then
-    log_warn "$(zh_en "e2fsck 报错(返回码 $rc), 不扩容了; 系统仍可启动, 重启后可手动 resize2fs $pdev" \
-                      "e2fsck reported errors (rc $rc); not resizing. The system can still boot; run resize2fs $pdev after reboot")"
+    log_warn "$(zh_en "e2fsck 报错(返回码 $rc), 先不扩容; 系统仍可启动, 重启后执行: e2fsck -fy $pdev && resize2fs $pdev" \
+                      "e2fsck reported errors (rc $rc); not resizing. The system still boots; after reboot run: e2fsck -fy $pdev && resize2fs $pdev")"
     return 0
   fi
-  if resize2fs "$pdev" >/dev/null 2>&1; then
-    log_info "$(zh_en "文件系统已扩到分区大小: $pdev" "Filesystem grown to the partition size: $pdev")"
-  else
-    log_warn "$(zh_en "resize2fs 失败, rootfs 仍是原大小(系统可正常启动); 重启后可手动执行 resize2fs $pdev" \
-                      "resize2fs failed, rootfs keeps its size (the system still boots); run resize2fs $pdev after reboot")"
+  if ! resize2fs "$pdev" >/dev/null 2>&1; then
+    log_warn "$(zh_en "resize2fs 失败, rootfs 仍是原大小(系统可正常启动); 重启后执行: resize2fs $pdev" \
+                      "resize2fs failed, rootfs keeps its size (the system still boots); after reboot run: resize2fs $pdev")"
+    return 0
+  fi
+
+  # ---- 扩容自证: 分区扇区数 vs 文件系统实际大小 ----
+  # 这一步是为了"整盘安装"能被验证: 装完必须看到根分区和文件系统都占满整盘,
+  # 而不是只在日志里说一句"已扩容"就完事。
+  pact=$(part_sectors "$pdev")
+  fsz=$(fs_bytes_at "$pdev" 0 2>/dev/null || true)
+  psz=$(( ${pact:-0} * SECTOR ))
+  if [ -n "$fsz" ] && [ "$fsz" -gt 0 ] 2>/dev/null && [ "$psz" -gt 0 ] 2>/dev/null; then
+    log_info "$(zh_en "根分区      : $pdev  $(bytes_to_mib "$psz") MiB" \
+                      "Root part   : $pdev  $(bytes_to_mib "$psz") MiB")"
+    log_info "$(zh_en "根文件系统  : $(bytes_to_mib "$fsz") MiB" \
+                      "Root fs     : $(bytes_to_mib "$fsz") MiB")"
+    # 文件系统比分区小 5% 以上就认为没扩干净, 明确告警(别让用户以为装完就是整盘)
+    if [ "$fsz" -lt $(( psz - psz / 20 )) ] 2>/dev/null; then
+      log_warn "$(zh_en "文件系统没扩到分区大小! 手动执行: resize2fs $pdev" \
+                        "The filesystem did NOT grow to the partition size! Run: resize2fs $pdev")"
+    else
+      log_info "$(zh_en "✅ 根文件系统已占满整个分区(整盘安装)" \
+                        "✅ Root filesystem fills the whole partition (full-disk install)")"
+    fi
   fi
   return 0
 }
@@ -1065,8 +1123,8 @@ check_target_size() {
 countdown() {
   # 这条警告是最关键的安全提示, 英文界面下也必须看得懂
   if [ "$CLONE" = "1" ]; then
-    log_warn "$(zh_en "5秒后把 $CLONE_SRC_PATH 的系统分区装到 $TARGET (重建分区表 + 复制 $(bytes_to_mib "$CLONE_BYTES") MiB)  ($(disk_desc "$(basename "$TARGET")"))" \
-                      "Installing the system partitions of $CLONE_SRC_PATH to $TARGET (new partition table + $(bytes_to_mib "$CLONE_BYTES") MiB copy)  ($(disk_desc "$(basename "$TARGET")")) in 5 seconds")"
+    log_warn "$(zh_en "5秒后把 $CLONE_SRC_PATH 的系统装到 $TARGET 整盘(重建分区表 + 复制 $(bytes_to_mib "$CLONE_BYTES") MiB, 根分区随后扩满整块盘)  ($(disk_desc "$(basename "$TARGET")"))" \
+                      "Installing the system of $CLONE_SRC_PATH onto the whole $TARGET (new partition table + $(bytes_to_mib "$CLONE_BYTES") MiB copy, root partition then grown to fill the disk)  ($(disk_desc "$(basename "$TARGET")")) in 5 seconds")"
   else
     log_warn "$(zh_en "5秒后将把 $FW 写入 $TARGET  ($(disk_desc "$(basename "$TARGET")"))" \
                       "Writing $FW to $TARGET  ($(disk_desc "$(basename "$TARGET")")) in 5 seconds")"
@@ -1169,7 +1227,7 @@ find_rootfs_partition() {
 
 post_install_space_report() {
   dev="$1"
-  log_info "$(zh_en '检查磁盘空间占用情况...' 'Checking disk space...')"
+  log_info "$(zh_en '整盘安装结果检查...' 'Checking the full-disk install result...')"
 
   if [ ! -r "$dev" ]; then
     log_warn "$(zh_en "无法读取 $dev, 跳过空间检查" "Cannot read $dev, skipping space check")"
@@ -1262,11 +1320,24 @@ EOF
   else
     root_end=$(( BEST_START + BEST_SIZE - 1 ))
     if [ "$root_end" -ge "$(( fsmax - 2048 ))" ] 2>/dev/null; then
-      # 克隆安装走的这条路: write_target_table 已把 rootfs 扩到盘尾, 这里只是确认。
-      log_info "$(zh_en "rootfs 分区 $(sectors_to_mib "$BEST_SIZE") MiB —— 已占满整盘 ✅" \
-                        "rootfs partition $(sectors_to_mib "$BEST_SIZE") MiB - fills the whole disk OK")"
-      log_info "$(zh_en '克隆安装已自动扩到盘尾, 不需要再手动扩容。' \
-                        'The clone install grew it automatically; no manual resizing needed.')"
+      # 克隆安装走的这条路: 分区已经扩到盘尾 —— 但还要看**文件系统**是否也扩了,
+      # 光看分区会在 resize2fs 失败时给出"已占满整盘"的假结论。
+      rpdev=$(target_part_dev "$(basename "$dev")" "$BEST_IDX")
+      rfsz=$(fs_bytes_at "$rpdev" 0 2>/dev/null || true)
+      rpsz=$(( BEST_SIZE * SECTOR ))
+      log_info "$(zh_en "rootfs 分区 $(sectors_to_mib "$BEST_SIZE") MiB" \
+                        "rootfs partition $(sectors_to_mib "$BEST_SIZE") MiB")"
+      if [ -n "$rfsz" ] && [ "$rfsz" -gt 0 ] 2>/dev/null; then
+        log_info "$(zh_en "rootfs 文件系统 $(bytes_to_mib "$rfsz") MiB" \
+                          "rootfs filesystem $(bytes_to_mib "$rfsz") MiB")"
+      fi
+      if [ -n "$rfsz" ] && [ "$rfsz" -gt 0 ] 2>/dev/null && [ "$rfsz" -lt $(( rpsz - rpsz / 20 )) ] 2>/dev/null; then
+        log_warn "$(zh_en "分区已占满整盘, 但文件系统没跟着扩! 执行: resize2fs $rpdev" \
+                          "The partition fills the disk but the filesystem did not grow! Run: resize2fs $rpdev")"
+      else
+        log_info "$(zh_en "✅ 整盘安装: 根分区/文件系统已占满整盘" \
+                          "✅ Full-disk install: the root partition and filesystem fill the disk")"
+      fi
     else
       log_info "$(zh_en "rootfs 分区 $(sectors_to_mib "$BEST_SIZE") MiB (镜像设计的 ${ROOT_PART_TARGET_MIB} MiB) ✅" \
                         "rootfs partition $(sectors_to_mib "$BEST_SIZE") MiB (the image default ${ROOT_PART_TARGET_MIB} MiB) OK")"
@@ -1830,7 +1901,9 @@ do_install() {
     sync
     # 给目标盘生成独立的 UUID, 并把 grub.cfg/fstab 里的引用同步改掉
     rewrite_target_uuids || true
+    # 整盘安装: ext4 版把根分区/文件系统扩满整盘; squashfs 版把剩余空间做成可写层
     grow_target_rootfs || true
+    add_tail_data_partition || true
   elif command -v gunzip >/dev/null 2>&1; then
     log_info "$(zh_en '解压并写入镜像...' 'Decompressing and writing the image...')"
     gunzip -c "$FW" | dd of="$TARGET" bs=4M conv=fsync
