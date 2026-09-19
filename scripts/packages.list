@@ -4,8 +4,10 @@
 # 这些包名已对照 OpenWrt 25.12.5 x86/64 官方源逐一验证存在。
 # 注意与旧 .config 的差异(旧名在 25.12 中已不存在, 从源码编时才会被静默忽略):
 #   kmod-r8152            -> kmod-usb-net-rtl8152   (RTL8153 USB 网卡)
-#   linux-firmware-mt7921e -> kmod-mt7921-firmware  (MT7922 固件)
-#   linux-firmware-mediatek -> (由 kmod-mt7921-firmware 覆盖, 无需单独装)
+#   linux-firmware-mt7921e -> kmod-mt7921-firmware + kmod-mt7922-firmware
+#     (MT7921 与 MT7922 的固件是**两个**包: 7922 的卡缺 kmod-mt7922-firmware
+#      就会"驱动加载了但接口不出来", 真机踩到过)
+#   linux-firmware-mediatek -> (由上面两个 kmod 固件包覆盖, 无需单独装)
 #   traceroute            -> 上游已无此包, 已移除
 #   luci-app-openclash / luci-app-oaf / appfilter / kmod-oaf
 #                         -> 由 workflow 从第三方 release 拉取预编译包, 不在此列出
@@ -37,9 +39,15 @@ kmod-ata-core
 kmod-ata-ahci
 kmod-nvme
 
-# ---- 无线网卡: MT7922 (mt7921e) + 固件 ----
+# ---- 无线网卡: MediaTek MT7921/MT7922 (mt7921e 驱动) + 固件 ----
+# 注意: MT7921 与 MT7922 的**固件是两个包**, 不能只装一个!
+#   缺 kmod-mt7922-firmware 时, mt7921e 能加载但拿不到固件 ->
+#   dmesg 报 "Direct firmware load for mediatek/WIFI_RAM_CODE_MT7922_1.bin failed",
+#   接口不出现, 表现就是"7922 网卡驱动没起来"(真机踩到)。
 kmod-mt7921e
 kmod-mt7921-firmware
+# MT7922 专用固件(7922 的卡必须装这个)
+kmod-mt7922-firmware
 
 # ---- 网络与调试工具 ----
 curl
