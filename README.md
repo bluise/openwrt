@@ -493,7 +493,8 @@ Wyse 3040 的无线模块是 **Marvell 88W8897**（模块型号 **AzureWave AW-C
 | 包 | 作用 |
 |---|---|
 | `kmod-mwifiex-sdio` | Marvell mwifiex 驱动（SDIO/88W8897） |
-| `mwifiex-sdio-firmware` | 驱动固件 `mrvl/sd8897_uapsta.bin` |
+| `mwifiex-sdio-firmware` | 8887/8997 的固件（OpenWrt 这个包里**没有** 8897 的） |
+| （构建时补的）`mrvl/sd8897_uapsta.bin` | 8897 真正要的固件：OpenWrt 的 `mwifiex-sdio-firmware` 只装 `sd8887_uapsta.bin` + `sdsd8997_combo_v4.bin`（见上游 `linux-firmware/marvell.mk`），所以构建时从 linux-firmware 取这一份补进 `/lib/firmware/mrvl/`（钉提交 + 校验 sha256） |
 | `kmod-mmc` | MMC/SDIO 核心（mwifiex-sdio 依赖） |
 | `kmod-sdhci` | Atom（Cherry Trail）的 SD/SDIO 主机控制器 |
 | `iwinfo` / `iw` | 无线诊断（信号、加密、接口能力） |
@@ -505,7 +506,8 @@ DietPi 论坛里同为 Wyse 3040 + AW-CM389MA 的实例。认证所需的 `wpad`
 
 ```sh
 ls /sys/bus/sdio/devices/                 # 有设备说明 SDIO 卡被识别
-dmesg | grep -i -E "mwifiex|sdio"         # 驱动加载与固件下载日志
+ls /lib/firmware/mrvl/                    # 应有 sd8897_uapsta.bin(8897 专用)
+dmesg | grep -i -E "mwifiex|sdio"         # 驱动加载与固件下载日志(应能看到 firmware download 成功)
 iw dev                                    # 应出现 mlan0(不是 wlan0)
 iwinfo                                    # 接口与加密方式
 ```

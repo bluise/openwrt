@@ -361,6 +361,27 @@ jobs:
             echo "::error::Argon 的 uci-defaults 没有把主题设为默认"; exit 1; }
           rm -rf "$TMP"
 
+      - name: Stage Marvell 8897 SDIO firmware (Wyse 3040 WiFi)
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # Wyse 3040 的无线网卡是 Marvell 88W8897(AW-CM389MA, SDIO), 驱动是
+          # kmod-mwifiex-sdio —— 但它要的固件是 mrvl/sd8897_uapsta.bin, 而 OpenWrt 的
+          # mwifiex-sdio-firmware 包只装了 8887/8997(见 linux-firmware/marvell.mk):
+          #   Package/mwifiex-sdio-firmware -> sd8887_uapsta.bin + sdsd8997_combo_v4.bin
+          # 所以 8897 这块卡的固件必须自己补进去, 否则驱动加载后卡在"firmware not found"。
+          # 来源: linux-firmware(mrvl/sd8897_uapsta.bin), 钉住提交 + 校验 sha256。
+          FW_COMMIT="b7c134f0d3491113958276d631b4e69771a6c5be"
+          FW_SHA256="c366b003c8dbc07605fc6f8d1344f560c981afa2af38913a16c7525dc78f61a3"
+          TMP=$(mktemp -d)
+          curl -fsSL -o "$TMP/sd8897_uapsta.bin" \
+            "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/mrvl/sd8897_uapsta.bin?h=${FW_COMMIT}"
+          echo "${FW_SHA256}  $TMP/sd8897_uapsta.bin" | sha256sum -c -
+          mkdir -p files/lib/firmware/mrvl
+          install -m 0644 "$TMP/sd8897_uapsta.bin" files/lib/firmware/mrvl/sd8897_uapsta.bin
+          ls -l files/lib/firmware/mrvl/
+          rm -rf "$TMP"
+
       - name: Stage DDNS-GO (x86_64 静态二进制 + LuCI 页面)
         if: steps.release.outputs.build == 'true'
         run: |
