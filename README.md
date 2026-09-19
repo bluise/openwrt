@@ -504,6 +504,12 @@ DietPi 论坛里同为 Wyse 3040 + AW-CM389MA 的实例。认证所需的 `wpad`
 
 **装好后怎么确认**：
 
+> **实测结论（Wyse 3040 真机，已通）**：硬件走的正是 Intel SDIO 控制器
+> （`00:11.0 SD Host controller [0805] 8086:2295`，见
+> [Debian 的 Wyse 3040 硬件页](https://wiki.debian.org/InstallingDebianOn/Dell/Wyse%203040)），
+> 而内核已内置 `sdhci-pci`/`mmc_core`，所以**唯一缺的就是驱动没被自动加载**：
+> 加载后立刻出现 `mlan0`，无线可用。
+>
 > 注意：`kmod-mwifiex-sdio` 这个包**不会**往 `/etc/modules.d/` 写自动加载条目
 > （镜像里能看到 `mmc`、`sdhci`、`mt7921e`，唯独没有它），所以本仓库额外放了
 > `files/etc/modules.d/mwifiex-sdio` 让驱动**开机自动加载**；临时手动加载：
